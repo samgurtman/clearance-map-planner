@@ -360,6 +360,7 @@ export function AirspacePlanner() {
   const mapRef = useRef<MapLibreMap | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const overtureReloadRef = useRef<() => void>(() => {});
+  const coverageBoundsRef = useRef<{ west: number; east: number; south: number; north: number } | null>(null);
   const liveDataRef = useRef({ altitudeFt: 1800, buildings: [] as Building[], zones: [] as Zone[], origin: CHICAGO_ORIGIN, sourceMode: "overture" as "overture" | "local" });
   const [altitudeFt, setAltitudeFt] = useState(1800);
   const [buildings, setBuildings] = useState<Building[]>([]);
@@ -460,28 +461,39 @@ export function AirspacePlanner() {
         const center = map.getCenter();
         const nextOrigin = { lat: center.lat, lon: center.lng };
         const source = map.getSource("overture-buildings") as GeoJSONSource;
-        setCoverageStatus("loading");
-        source.setData(emptyFeatures());
-        setOrigin(nextOrigin);
-        setBuildings([]);
-        setZones([viewportStudyZone(map, nextOrigin)]);
+        const viewportBounds = map.getBounds();
+        const previousCoverage = coverageBoundsRef.current;
+        const viewportAlreadyCovered = Boolean(previousCoverage
+          && viewportBounds.getWest() >= previousCoverage.west
+          && viewportBounds.getEast() <= previousCoverage.east
+          && viewportBounds.getSouth() >= previousCoverage.south
+          && viewportBounds.getNorth() <= previousCoverage.north);
+        const clearCoverage = () => {
+          coverageBoundsRef.current = null;
+          source.setData(emptyFeatures());
+          setOrigin(nextOrigin);
+          setBuildings([]);
+          setZones([viewportStudyZone(map, nextOrigin)]);
+        };
+        setCoverageStatus(viewportAlreadyCovered ? "ready" : "loading");
         if (map.getZoom() < 12.5) {
+          clearCoverage();
           setCoverageStatus("zoom-required");
           setDataNote("Zoom to neighborhood level to load building envelopes");
           return;
         }
         const zoom = 14;
-        const bounds = map.getBounds();
         const maxTile = (2 ** zoom) - 1;
-        const minX = Math.max(0, Math.min(maxTile, tileX(bounds.getWest(), zoom)));
-        const maxX = Math.max(0, Math.min(maxTile, tileX(bounds.getEast(), zoom)));
-        const minY = Math.max(0, Math.min(maxTile, tileY(bounds.getNorth(), zoom)));
-        const maxY = Math.max(0, Math.min(maxTile, tileY(bounds.getSouth(), zoom)));
+        const minX = Math.max(0, Math.min(maxTile, tileX(viewportBounds.getWest(), zoom)));
+        const maxX = Math.max(0, Math.min(maxTile, tileX(viewportBounds.getEast(), zoom)));
+        const minY = Math.max(0, Math.min(maxTile, tileY(viewportBounds.getNorth(), zoom)));
+        const maxY = Math.max(0, Math.min(maxTile, tileY(viewportBounds.getSouth(), zoom)));
         const coordinates: Array<{ x: number; y: number }> = [];
         for (let x = minX; x <= maxX; x += 1) {
           for (let y = minY; y <= maxY; y += 1) coordinates.push({ x, y });
         }
         if (!coordinates.length || coordinates.length > 8) {
+          clearCoverage();
           setCoverageStatus("zoom-required");
           setDataNote("Zoom in to load a smaller set of building tiles");
           return;
@@ -531,14 +543,26 @@ export function AirspacePlanner() {
           setOrigin(nextOrigin);
           setBuildings(nextBuildings);
           setZones([viewportStudyZone(map, nextOrigin)]);
+          coverageBoundsRef.current = {
+            west: viewportBounds.getWest(),
+            east: viewportBounds.getEast(),
+            south: viewportBounds.getSouth(),
+            north: viewportBounds.getNorth(),
+          };
           setCoverageStatus("ready");
           setDatasetName(`Overture Maps · ${release}`);
           setDataNote(`${nextBuildings.length.toLocaleString()} visible envelopes · ${measured.toLocaleString()} with height/floor data`);
         } catch (error) {
           console.error("Overture building tile load failed", error);
           if (!disposed && requestId === loadSerial) {
-            setCoverageStatus("error");
-            setDataNote("Overture building tiles could not be reached. Reload to try again.");
+            if (viewportAlreadyCovered) {
+              setCoverageStatus("ready");
+              setDataNote("Using previously loaded coverage · refresh unavailable");
+            } else {
+              clearCoverage();
+              setCoverageStatus("error");
+              setDataNote("Overture building tiles could not be reached. Reload to try again.");
+            }
           }
         }
       };
@@ -625,6 +649,7 @@ export function AirspacePlanner() {
       const imported = file.name.toLowerCase().endsWith(".csv") ? parseCsv(text) : parseGeoJson(text);
       if (!imported.buildings.length) throw new Error("No usable building records were found.");
       setSourceMode("local");
+      coverageBoundsRef.current = null;
       setCoverageStatus("ready");
       setBuildings(imported.buildings);
       setOrigin(imported.origin);
@@ -644,6 +669,7 @@ export function AirspacePlanner() {
     const center = mapRef.current?.getCenter();
     const nextOrigin = center ? { lat: center.lat, lon: center.lng } : CHICAGO_ORIGIN;
     setSourceMode("overture");
+    coverageBoundsRef.current = null;
     setCoverageStatus("loading");
     setBuildings([]);
     setOrigin(nextOrigin);
