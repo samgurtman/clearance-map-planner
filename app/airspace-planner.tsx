@@ -48,6 +48,7 @@ const OVERTURE_MEMORY_CACHE_MAX_TILES = 48;
 const OVERTURE_MEMORY_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 const OVERTURE_PERSISTENT_CACHE_MAX_TILES = 256;
 const OVERTURE_PERSISTENT_CACHE_MAX_BYTES = 256 * 1024 * 1024;
+const MAP_ZOOM_LEVELS = Array.from({ length: 25 }, (_, index) => index);
 const FEET_PER_LAT_DEGREE = 364_000;
 const feetPerLonDegree = (latitude: number) => 364_000 * Math.cos((latitude * Math.PI) / 180);
 
@@ -566,6 +567,7 @@ export function AirspacePlanner() {
   const [mapReady, setMapReady] = useState(false);
   const [basemapError, setBasemapError] = useState(false);
   const [basemap, setBasemap] = useState<Basemap>("street");
+  const [zoomLevel, setZoomLevel] = useState(14);
 
   useEffect(() => {
     liveDataRef.current = { altitudeFt, buildings, zones, origin, sourceMode };
@@ -665,6 +667,7 @@ export function AirspacePlanner() {
         attributionControl: {},
       });
       mapRef.current = map;
+      setZoomLevel(Math.round(map.getZoom()));
 
       const loadVisibleBuildingTiles = async () => {
         if (liveDataRef.current.sourceMode !== "overture" || !map.getSource("overture-buildings")) return;
@@ -852,6 +855,7 @@ export function AirspacePlanner() {
         });
       });
       map.on("moveend", () => { void loadVisibleBuildingTiles(); });
+      map.on("zoomend", () => setZoomLevel(Math.round(map.getZoom())));
       map.on("click", (event) => {
         setSelectedLngLat([event.lngLat.lng, event.lngLat.lat]);
       });
@@ -1042,6 +1046,16 @@ export function AirspacePlanner() {
             <button className={basemap === "street" ? "active" : ""} aria-pressed={basemap === "street"} onClick={() => setBasemap("street")}>Street</button>
             <button className={basemap === "sectional" ? "active" : ""} aria-pressed={basemap === "sectional"} title="Sectionals with Terminal Area Charts where available" onClick={() => setBasemap("sectional")}>FAA Charts</button>
           </div>
+          <label className="zoom-picker">
+            <span>Zoom</span>
+            <select value={zoomLevel} aria-label="Map zoom level" onChange={(event) => {
+              const nextZoom = Number(event.target.value);
+              setZoomLevel(nextZoom);
+              mapRef.current?.easeTo({ zoom: nextZoom, duration: 450 });
+            }}>
+              {MAP_ZOOM_LEVELS.map((level) => <option key={level} value={level}>{level}{level === 24 ? " · MAX" : ""}</option>)}
+            </select>
+          </label>
           <div className="legend" aria-label="Map legend"><span><i className="legend-red" />Envelope conflict</span><span><i className="legend-amber" />Study polygon</span><span><i className="legend-building" />Building envelope</span></div>
           <div className="dataset-card"><span className="dataset-icon" aria-hidden="true">▤</span><span><small>{sourceMode === "overture" ? "AUTOMATIC BUILDING LAYER" : "LOCAL OVERRIDE"}</small><strong>{datasetName}</strong><em>{dataNote}</em></span>{sourceMode === "local" ? <button onClick={activateOverture}>Use Overture</button> : <span className={`data-live ${modelAvailable ? "" : "paused"}`}>{modelAvailable ? "LIVE" : coverageBadge}</span>}</div>
           <div className="basemap-badge">BASEMAP · {basemap === "street" ? "CARTO / OPENSTREETMAP" : "FAA SECTIONAL + TAC"}</div>

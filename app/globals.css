@@ -145,6 +145,9 @@ button { color: inherit; }
 .basemap-switch button { min-height: 35px; border: 0; border-right: 1px solid var(--line); padding: 0 11px; background: transparent; color: #657075; font-size: 8px; font-weight: 900; letter-spacing: .06em; text-transform: uppercase; cursor: pointer; }
 .basemap-switch button:last-child { border-right: 0; }
 .basemap-switch button.active { background: var(--ink); color: white; }
+.zoom-picker { position: absolute; z-index: 2; right: 65px; top: 61px; display: flex; align-items: center; gap: 7px; min-height: 31px; padding: 0 7px 0 9px; border: 1px solid rgba(24,34,41,.18); background: rgba(255,253,247,.94); box-shadow: 0 8px 22px rgba(38,42,42,.08); }
+.zoom-picker span { color: #768084; font-size: 7px; font-weight: 900; letter-spacing: .08em; text-transform: uppercase; }
+.zoom-picker select { min-width: 66px; border: 0; border-left: 1px solid var(--line); border-radius: 0; padding: 5px 3px 5px 8px; background: transparent; color: var(--ink); font-size: 9px; font-weight: 900; cursor: pointer; }
 .legend { position: absolute; z-index: 2; top: 18px; left: 18px; display: flex; gap: 14px; padding: 9px 11px; background: rgba(255,253,247,.9); border: 1px solid rgba(24,34,41,.15); font-size: 8px; font-weight: 800; }
 .legend span { display: flex; align-items: center; gap: 6px; }
 .legend i { width: 10px; height: 10px; display: inline-block; }
@@ -200,7 +203,7 @@ button { color: inherit; }
 
 .visually-hidden { position: absolute !important; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 
-button:focus-visible, input:focus-visible, canvas:focus-visible, a:focus-visible { outline: 3px solid rgba(223,61,51,.38); outline-offset: 2px; }
+button:focus-visible, input:focus-visible, select:focus-visible, canvas:focus-visible, a:focus-visible { outline: 3px solid rgba(223,61,51,.38); outline-offset: 2px; }
 
 @media (max-width: 1050px) {
   .rule-chip, .overture-status { display: none; }
@@ -228,6 +231,7 @@ button:focus-visible, input:focus-visible, canvas:focus-visible, a:focus-visible
   .map-titlebar { top: 12px; left: 12px; min-width: 250px; }
   .map-controls { top: 12px; right: 12px; }
   .basemap-switch { top: 126px; right: 12px; }
+  .zoom-picker { top: 169px; right: 12px; }
   .legend { top: 70px; left: 12px; }
   .dataset-card { left: 12px; bottom: 18px; }
   .basemap-badge { display: none; }
