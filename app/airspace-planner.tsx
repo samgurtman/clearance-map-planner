@@ -48,7 +48,6 @@ const OVERTURE_MEMORY_CACHE_MAX_TILES = 48;
 const OVERTURE_MEMORY_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 const OVERTURE_PERSISTENT_CACHE_MAX_TILES = 256;
 const OVERTURE_PERSISTENT_CACHE_MAX_BYTES = 256 * 1024 * 1024;
-const MAP_ZOOM_LEVELS = Array.from({ length: 25 }, (_, index) => index);
 const FEET_PER_LAT_DEGREE = 364_000;
 const feetPerLonDegree = (latitude: number) => 364_000 * Math.cos((latitude * Math.PI) / 180);
 
@@ -550,6 +549,8 @@ export function AirspacePlanner() {
   const loadedTileKeyRef = useRef<string | null>(null);
   const loadedViewportKeyRef = useRef<string | null>(null);
   const pendingTileKeyRef = useRef<string | null>(null);
+  const overtureTileZoomRef = useRef(14);
+  const overtureMaxTileZoomRef = useRef(14);
   const liveDataRef = useRef({ altitudeFt: 1800, buildings: [] as Building[], zones: [] as Zone[], origin: CHICAGO_ORIGIN, sourceMode: "overture" as "overture" | "local" });
   const [altitudeFt, setAltitudeFt] = useState(1800);
   const [buildings, setBuildings] = useState<Building[]>([]);
@@ -567,14 +568,17 @@ export function AirspacePlanner() {
   const [mapReady, setMapReady] = useState(false);
   const [basemapError, setBasemapError] = useState(false);
   const [basemap, setBasemap] = useState<Basemap>("street");
-  const [zoomLevel, setZoomLevel] = useState(14);
+  const [overtureTileZoom, setOvertureTileZoom] = useState(14);
+  const [overtureTileZoomRange, setOvertureTileZoomRange] = useState({ min: 12, max: 14 });
+  const [loadedOvertureTileZoom, setLoadedOvertureTileZoom] = useState<number | null>(null);
 
   useEffect(() => {
     liveDataRef.current = { altitudeFt, buildings, zones, origin, sourceMode };
   }, [altitudeFt, buildings, zones, origin, sourceMode]);
 
   const selected = useMemo(() => lngLatToLocal(selectedLngLat[0], selectedLngLat[1], origin), [selectedLngLat, origin]);
-  const modelAvailable = sourceMode === "local" || coverageStatus === "ready";
+  const fullDetailAvailable = sourceMode === "local" || (overtureTileZoom === overtureTileZoomRange.max && loadedOvertureTileZoom === overtureTileZoomRange.max);
+  const modelAvailable = sourceMode === "local" || (coverageStatus === "ready" && fullDetailAvailable);
   const check = useMemo<Check>(
     () => modelAvailable ? evaluatePoint(selected, altitudeFt, buildings, zones) : { state: "unavailable" },
     [modelAvailable, selected, altitudeFt, buildings, zones],
@@ -588,6 +592,7 @@ export function AirspacePlanner() {
   const zonesGeoJson = useMemo(() => featureCollection(zones.map((zone) => zoneFeature(zone, origin))), [zones, origin]);
   const selectedGeoJson = useMemo(() => featureCollection([point(localToLngLat(selected, origin), { state: check.state })]), [selected, origin, check.state]);
   const conflictsGeoJson = useMemo(() => {
+    if (!modelAvailable) return emptyFeatures();
     if (altitudeFt < 1000) return featureCollection(zones.map((zone) => zoneFeature(zone, origin)));
     const features: Array<Feature<Polygon | MultiPolygon>> = [];
     const active = buildings.filter((building) => altitudeFt < building.heightFt + 1000);
@@ -604,7 +609,7 @@ export function AirspacePlanner() {
       });
     });
     return featureCollection(features);
-  }, [altitudeFt, buildings, zones, origin]);
+  }, [modelAvailable, altitudeFt, buildings, zones, origin]);
 
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) return;
@@ -667,7 +672,6 @@ export function AirspacePlanner() {
         attributionControl: {},
       });
       mapRef.current = map;
-      setZoomLevel(Math.round(map.getZoom()));
 
       const loadVisibleBuildingTiles = async () => {
         if (liveDataRef.current.sourceMode !== "overture" || !map.getSource("overture-buildings")) return;
@@ -697,6 +701,7 @@ export function AirspacePlanner() {
           setOrigin(nextOrigin);
           setBuildings([]);
           setZones([viewportStudyZone(map, nextOrigin)]);
+          setLoadedOvertureTileZoom(null);
         };
         if (map.getZoom() < 12.5) {
           clearCoverage();
@@ -704,7 +709,7 @@ export function AirspacePlanner() {
           setDataNote("Zoom to neighborhood level to load building envelopes");
           return;
         }
-        const zoom = 14;
+        const zoom = overtureTileZoomRef.current;
         const maxTile = (2 ** zoom) - 1;
         const minX = Math.max(0, Math.min(maxTile, tileX(viewportBounds.getWest(), zoom)));
         const maxX = Math.max(0, Math.min(maxTile, tileX(viewportBounds.getEast(), zoom)));
@@ -792,6 +797,7 @@ export function AirspacePlanner() {
           setOrigin(nextOrigin);
           setBuildings(nextBuildings);
           setZones([viewportStudyZone(map, nextOrigin)]);
+          setLoadedOvertureTileZoom(zoom);
           loadedTileKeyRef.current = tileKey;
           loadedViewportKeyRef.current = viewportKey;
           pendingTileKeyRef.current = null;
@@ -803,7 +809,8 @@ export function AirspacePlanner() {
           };
           setCoverageStatus("ready");
           setDatasetName(`Overture Maps · ${release}`);
-          setDataNote(`${nextBuildings.length.toLocaleString()} visible envelopes · ${measured.toLocaleString()} with height/floor data`);
+          const detailNote = zoom === overtureMaxTileZoomRef.current ? "full-detail tile" : "generalized preview";
+          setDataNote(`${nextBuildings.length.toLocaleString()} visible envelopes · ${measured.toLocaleString()} with height/floor data · z${zoom} ${detailNote}`);
         } catch (error) {
           console.error("Overture building tile load failed", error);
           if (!disposed && requestId === loadSerial) {
@@ -828,7 +835,12 @@ export function AirspacePlanner() {
         setDataNote("Connecting to Overture building archive…");
         requestAnimationFrame(async () => {
           try {
-            await archive.getHeader();
+            const header = await archive.getHeader();
+            const selectableMinZoom = Math.max(header.minZoom, header.maxZoom - 2);
+            overtureMaxTileZoomRef.current = header.maxZoom;
+            overtureTileZoomRef.current = header.maxZoom;
+            setOvertureTileZoomRange({ min: selectableMinZoom, max: header.maxZoom });
+            setOvertureTileZoom(header.maxZoom);
             const beforeId = map.getStyle().layers?.find((layer) => layer.type === "symbol")?.id;
             map.addSource("overture-buildings", { type: "geojson", data: emptyFeatures(), attribution: '<a href="https://docs.overturemaps.org/attribution" target="_blank">© Overture Maps Foundation</a>' });
             map.addSource("clearance-zones", { type: "geojson", data: emptyFeatures() });
@@ -855,7 +867,6 @@ export function AirspacePlanner() {
         });
       });
       map.on("moveend", () => { void loadVisibleBuildingTiles(); });
-      map.on("zoomend", () => setZoomLevel(Math.round(map.getZoom())));
       map.on("click", (event) => {
         setSelectedLngLat([event.lngLat.lng, event.lngLat.lat]);
       });
@@ -894,8 +905,9 @@ export function AirspacePlanner() {
   }, [mapReady, zonesGeoJson, conflictsGeoJson, buildingsGeoJson, selectedGeoJson, sourceMode]);
 
   useEffect(() => {
+    overtureTileZoomRef.current = overtureTileZoom;
     if (mapReady && sourceMode === "overture") overtureReloadRef.current();
-  }, [mapReady, sourceMode]);
+  }, [mapReady, overtureTileZoom, sourceMode]);
 
   useEffect(() => {
     if (!mapReady || !mapRef.current) return;
@@ -917,6 +929,7 @@ export function AirspacePlanner() {
       if (!imported.buildings.length) throw new Error("No usable building records were found.");
       setSourceMode("local");
       coverageBoundsRef.current = null;
+      setLoadedOvertureTileZoom(null);
       loadedTileKeyRef.current = null;
       loadedViewportKeyRef.current = null;
       pendingTileKeyRef.current = null;
@@ -940,6 +953,7 @@ export function AirspacePlanner() {
     const nextOrigin = center ? { lat: center.lat, lon: center.lng } : CHICAGO_ORIGIN;
     setSourceMode("overture");
     coverageBoundsRef.current = null;
+    setLoadedOvertureTileZoom(null);
     loadedTileKeyRef.current = null;
     loadedViewportKeyRef.current = null;
     pendingTileKeyRef.current = null;
@@ -979,9 +993,9 @@ export function AirspacePlanner() {
     : coverageStatus === "error"
       ? "Overture Maps · Coverage unavailable"
       : coverageStatus === "ready"
-        ? "Overture Maps · Coverage loaded"
+        ? fullDetailAvailable ? "Overture Maps · Coverage loaded" : `Overture Maps · z${overtureTileZoom} preview`
         : "Overture Maps · Zoom in required";
-  const coverageBadge = coverageStatus === "loading" ? "LOADING" : coverageStatus === "error" ? "ERROR" : "ZOOM IN";
+  const coverageBadge = coverageStatus === "loading" ? "LOADING" : coverageStatus === "error" ? "ERROR" : coverageStatus === "ready" && !fullDetailAvailable ? "PREVIEW" : "ZOOM IN";
 
   return (
     <main className="app-shell">
@@ -1010,7 +1024,7 @@ export function AirspacePlanner() {
 
           <div className={`point-check ${check.state}`} aria-live="polite">
             <div className="point-check-title"><span className="check-symbol">{check.state === "conflict" ? "!" : check.state === "clear" ? "✓" : check.state === "unavailable" ? "?" : "·"}</span><span><small>SELECTED POINT</small>{statusTitle}</span></div>
-            {check.state === "unavailable" ? <p>Zoom in until Overture building coverage loads. No clearance result is shown without evaluated building data.</p> : check.state !== "outside" ? <dl>
+            {check.state === "unavailable" ? <p>{coverageStatus === "ready" && !fullDetailAvailable ? `Select Overture z${overtureTileZoomRange.max} full detail to evaluate clearance. Lower tile zooms are visualization-only.` : "Zoom in until Overture building coverage loads. No clearance result is shown without evaluated building data."}</p> : check.state !== "outside" ? <dl>
               <div><dt>Required altitude</dt><dd>{check.requiredFt?.toLocaleString()} ft</dd></div>
               <div><dt>{(check.marginFt ?? 0) < 0 ? "Shortfall" : "Margin"}</dt><dd>{Math.abs(check.marginFt ?? 0).toLocaleString()} ft</dd></div>
               <div><dt>Highest within 2,000 ft</dt><dd>{check.obstacle?.name ?? "Ground baseline"}</dd></div>
@@ -1047,13 +1061,9 @@ export function AirspacePlanner() {
             <button className={basemap === "sectional" ? "active" : ""} aria-pressed={basemap === "sectional"} title="Sectionals with Terminal Area Charts where available" onClick={() => setBasemap("sectional")}>FAA Charts</button>
           </div>
           <label className="zoom-picker">
-            <span>Zoom</span>
-            <select value={zoomLevel} aria-label="Map zoom level" onChange={(event) => {
-              const nextZoom = Number(event.target.value);
-              setZoomLevel(nextZoom);
-              mapRef.current?.easeTo({ zoom: nextZoom, duration: 450 });
-            }}>
-              {MAP_ZOOM_LEVELS.map((level) => <option key={level} value={level}>{level}{level === 24 ? " · MAX" : ""}</option>)}
+            <span>Overture tiles</span>
+            <select value={overtureTileZoom} aria-label="Overture overlay tile zoom" onChange={(event) => setOvertureTileZoom(Number(event.target.value))}>
+              {Array.from({ length: overtureTileZoomRange.max - overtureTileZoomRange.min + 1 }, (_, index) => overtureTileZoomRange.min + index).map((level) => <option key={level} value={level}>z{level}{level === overtureTileZoomRange.max ? " · FULL" : " · PREVIEW"}</option>)}
             </select>
           </label>
           <div className="legend" aria-label="Map legend"><span><i className="legend-red" />Envelope conflict</span><span><i className="legend-amber" />Study polygon</span><span><i className="legend-building" />Building envelope</span></div>
@@ -1073,6 +1083,7 @@ export function AirspacePlanner() {
           <h2 id="limitations-title">Full envelopes, with important limits.</h2>
           <p>GeoJSON Polygon and MultiPolygon outer footprints are preserved. The red geometry begins at the closest footprint edge, buffers it by 2,000 feet, and compares the selected altitude with the building height plus 1,000 feet.</p>
           <p>When more than 500 obstacles are active in one view, nearby envelopes are conservatively grouped for the red overlay so the altitude control stays responsive. The selected-point check still tests the individual building envelopes.</p>
+          <p>Overture overlay tile zoom is selectable across the archive’s three most detailed levels. Lower levels are generalized previews and do not produce clearance conclusions; select the level marked FULL for evaluation.</p>
           <p>The FAA evaluates whether an area is “congested” case by case. The visible map extent is treated as a conservative study area—not labeled as an official FAA boundary.</p>
           <div className="modal-warning"><b>Small UAS note</b><span>Part 107 generally uses a different 400-foot AGL framework and may require airspace authorization. This prototype models the Part 91 rule named above.</span></div>
           <div className="source-detail">
