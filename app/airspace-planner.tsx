@@ -40,6 +40,7 @@ const CHICAGO_ORIGIN: Origin = { lat: 41.8819, lon: -87.6324 };
 const OVERTURE_FALLBACK_RELEASE = "2026-07-22.0";
 const OVERTURE_CATALOG_URL = "https://stac.overturemaps.org/catalog.json";
 const FAA_SECTIONAL_TILE_URL = "https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer/tile/{z}/{y}/{x}";
+const FAA_TERMINAL_TILE_URL = "https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Terminal/MapServer/tile/{z}/{y}/{x}";
 const OVERTURE_TILE_CACHE_DB = "clearance-overture-tile-cache-v1";
 const OVERTURE_TILE_CACHE_STORE = "tiles";
 const OVERTURE_TILE_CACHE_META_STORE = "metadata";
@@ -641,10 +642,19 @@ export function AirspacePlanner() {
               maxzoom: 12,
               attribution: '<a href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/vfr/" target="_blank">FAA VFR Sectional</a>',
             },
+            "faa-terminal": {
+              type: "raster",
+              tiles: [FAA_TERMINAL_TILE_URL],
+              tileSize: 256,
+              minzoom: 10,
+              maxzoom: 12,
+              attribution: '<a href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/vfr/" target="_blank">FAA VFR Terminal Area Charts</a>',
+            },
           },
           layers: [
             { id: "carto-positron", type: "raster", source: "carto-positron", minzoom: 0 },
             { id: "faa-sectional", type: "raster", source: "faa-sectional", minzoom: 8, layout: { visibility: "none" } },
+            { id: "faa-terminal", type: "raster", source: "faa-terminal", minzoom: 10, layout: { visibility: "none" } },
           ],
         },
         center: [CHICAGO_ORIGIN.lon, CHICAGO_ORIGIN.lat],
@@ -886,9 +896,11 @@ export function AirspacePlanner() {
   useEffect(() => {
     if (!mapReady || !mapRef.current) return;
     const streetVisibility = basemap === "street" ? "visible" : "none";
-    const sectionalVisibility = basemap === "sectional" ? "visible" : "none";
+    const faaVisibility = basemap === "sectional" ? "visible" : "none";
     if (mapRef.current.getLayer("carto-positron")) mapRef.current.setLayoutProperty("carto-positron", "visibility", streetVisibility);
-    if (mapRef.current.getLayer("faa-sectional")) mapRef.current.setLayoutProperty("faa-sectional", "visibility", sectionalVisibility);
+    ["faa-sectional", "faa-terminal"].forEach((id) => {
+      if (mapRef.current?.getLayer(id)) mapRef.current.setLayoutProperty(id, "visibility", faaVisibility);
+    });
   }, [basemap, mapReady]);
 
   async function handleImport(event: ChangeEvent<HTMLInputElement>) {
@@ -1028,11 +1040,11 @@ export function AirspacePlanner() {
           </div>
           <div className="basemap-switch" role="group" aria-label="Select basemap">
             <button className={basemap === "street" ? "active" : ""} aria-pressed={basemap === "street"} onClick={() => setBasemap("street")}>Street</button>
-            <button className={basemap === "sectional" ? "active" : ""} aria-pressed={basemap === "sectional"} onClick={() => setBasemap("sectional")}>FAA Sectional</button>
+            <button className={basemap === "sectional" ? "active" : ""} aria-pressed={basemap === "sectional"} title="Sectionals with Terminal Area Charts where available" onClick={() => setBasemap("sectional")}>FAA Charts</button>
           </div>
           <div className="legend" aria-label="Map legend"><span><i className="legend-red" />Envelope conflict</span><span><i className="legend-amber" />Study polygon</span><span><i className="legend-building" />Building envelope</span></div>
           <div className="dataset-card"><span className="dataset-icon" aria-hidden="true">▤</span><span><small>{sourceMode === "overture" ? "AUTOMATIC BUILDING LAYER" : "LOCAL OVERRIDE"}</small><strong>{datasetName}</strong><em>{dataNote}</em></span>{sourceMode === "local" ? <button onClick={activateOverture}>Use Overture</button> : <span className={`data-live ${modelAvailable ? "" : "paused"}`}>{modelAvailable ? "LIVE" : coverageBadge}</span>}</div>
-          <div className="basemap-badge">BASEMAP · {basemap === "street" ? "CARTO / OPENSTREETMAP" : "FAA VFR SECTIONAL"}</div>
+          <div className="basemap-badge">BASEMAP · {basemap === "street" ? "CARTO / OPENSTREETMAP" : "FAA SECTIONAL + TAC"}</div>
         </section>
       </section>
 
@@ -1055,7 +1067,7 @@ export function AirspacePlanner() {
             <a href="https://docs.overturemaps.org/guides/buildings/" target="_blank" rel="noreferrer">Open Overture Buildings guide ↗</a>
           </div>
           <div className="file-help"><h3>Advanced local override</h3><p>GeoJSON: use <code>height_ft</code>, Overture <code>height</code> (meters), <code>height_m</code>, <code>num_floors</code>, or <code>building:levels</code>. CSV: include <code>lat, lon, height_ft, width_ft, depth_ft</code>.</p><div className="file-actions"><button onClick={() => inputRef.current?.click()}>Import local file</button><button onClick={downloadTemplate}>Download CSV template</button>{sourceMode === "local" && <button onClick={activateOverture}>Return to Overture</button>}</div></div>
-          <div className="modal-links"><a href="https://www.faa.gov/about/office_org/headquarters_offices/agc/practice_areas/regulations/interpretations/Data/interps/2009/Anderson_2009_Legal_Interpretation.pdf" target="_blank" rel="noreferrer">FAA Anderson interpretation ↗</a><a href="https://carto.com/basemaps/" target="_blank" rel="noreferrer">Street basemap ↗</a><a href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/vfr/" target="_blank" rel="noreferrer">FAA sectional source ↗</a></div>
+          <div className="modal-links"><a href="https://www.faa.gov/about/office_org/headquarters_offices/agc/practice_areas/regulations/interpretations/Data/interps/2009/Anderson_2009_Legal_Interpretation.pdf" target="_blank" rel="noreferrer">FAA Anderson interpretation ↗</a><a href="https://carto.com/basemaps/" target="_blank" rel="noreferrer">Street basemap ↗</a><a href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/vfr/" target="_blank" rel="noreferrer">FAA chart sources ↗</a></div>
         </section>
       </div>}
     </main>
