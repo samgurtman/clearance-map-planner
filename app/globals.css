@@ -141,6 +141,10 @@ button { color: inherit; }
 .map-controls { position: absolute; z-index: 2; right: 18px; top: 18px; display: flex; flex-direction: column; border: 1px solid rgba(24,34,41,.18); box-shadow: 0 8px 22px rgba(38,42,42,.08); }
 .map-controls button { width: 35px; height: 35px; border: 0; border-bottom: 1px solid var(--line); background: rgba(255,253,247,.94); font-size: 17px; cursor: pointer; }
 .map-controls button:last-child { border-bottom: 0; font-size: 13px; }
+.basemap-switch { position: absolute; z-index: 2; right: 65px; top: 18px; display: flex; border: 1px solid rgba(24,34,41,.18); background: rgba(255,253,247,.94); box-shadow: 0 8px 22px rgba(38,42,42,.08); }
+.basemap-switch button { min-height: 35px; border: 0; border-right: 1px solid var(--line); padding: 0 11px; background: transparent; color: #657075; font-size: 8px; font-weight: 900; letter-spacing: .06em; text-transform: uppercase; cursor: pointer; }
+.basemap-switch button:last-child { border-right: 0; }
+.basemap-switch button.active { background: var(--ink); color: white; }
 .legend { position: absolute; z-index: 2; top: 18px; left: 18px; display: flex; gap: 14px; padding: 9px 11px; background: rgba(255,253,247,.9); border: 1px solid rgba(24,34,41,.15); font-size: 8px; font-weight: 800; }
 .legend span { display: flex; align-items: center; gap: 6px; }
 .legend i { width: 10px; height: 10px; display: inline-block; }
@@ -223,6 +227,7 @@ button:focus-visible, input:focus-visible, canvas:focus-visible, a:focus-visible
   .map-panel { min-height: 560px; height: 65vh; }
   .map-titlebar { top: 12px; left: 12px; min-width: 250px; }
   .map-controls { top: 12px; right: 12px; }
+  .basemap-switch { top: 126px; right: 12px; }
   .legend { top: 70px; left: 12px; }
   .dataset-card { left: 12px; bottom: 18px; }
   .basemap-badge { display: none; }
