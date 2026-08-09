@@ -11,7 +11,7 @@ import {
   useRef,
   useState,
 } from "react";
-import type { GeoJSONSource, Map as MapLibreMap, MapGeoJSONFeature } from "maplibre-gl";
+import type { GeoJSONSource, Map as MapLibreMap } from "maplibre-gl";
 
 type Point = { x: number; y: number };
 type Origin = { lat: number; lon: number };
@@ -253,22 +253,47 @@ function estimateFlaggedSquareMiles(altitudeFt: number, buildings: Building[], z
   return (flagged * step * step) / 27_878_400;
 }
 
+function groupDenseBuildings(buildings: Building[], cellSize = 750): Building[] {
+  const groups = new Map<string, { minX: number; minY: number; maxX: number; maxY: number; heightFt: number; count: number }>();
+  buildings.forEach((building) => {
+    const key = `${Math.floor(building.x / cellSize)}:${Math.floor(building.y / cellSize)}`;
+    const points = building.envelopes.flat();
+    const current = groups.get(key) || { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity, heightFt: 0, count: 0 };
+    points.forEach((value) => {
+      current.minX = Math.min(current.minX, value.x);
+      current.minY = Math.min(current.minY, value.y);
+      current.maxX = Math.max(current.maxX, value.x);
+      current.maxY = Math.max(current.maxY, value.y);
+    });
+    current.heightFt = Math.max(current.heightFt, building.heightFt);
+    current.count += 1;
+    groups.set(key, current);
+  });
+  return [...groups.entries()].map(([key, group]) => {
+    const width = Math.max(20, group.maxX - group.minX);
+    const depth = Math.max(20, group.maxY - group.minY);
+    const x = (group.minX + group.maxX) / 2;
+    const y = (group.minY + group.maxY) / 2;
+    return { id: `group-${key}`, name: `${group.count} nearby envelopes`, x, y, envelopes: [rectangleEnvelope(x, y, width, depth)], heightFt: group.heightFt, heightSource: "Dense-view group" };
+  });
+}
+
 const emptyFeatures = (): FeatureCollection => featureCollection([]);
 
-function ringsFromMapFeature(feature: MapGeoJSONFeature): number[][][] {
+function ringsFromOvertureFeature(feature: Feature<Polygon | MultiPolygon>): number[][][] {
   if (feature.geometry.type === "Polygon") return [(feature.geometry.coordinates as number[][][])[0]];
   if (feature.geometry.type === "MultiPolygon") return (feature.geometry.coordinates as number[][][][]).map((candidate) => candidate[0]);
   return [];
 }
 
-function visibleOvertureBuildings(map: MapLibreMap, origin: Origin): Building[] {
-  const features = map.queryRenderedFeatures({ layers: ["overture-building-fill", "overture-building-part-fill"] });
+function overtureBuildingsFromFeatures(features: Array<Feature<Polygon | MultiPolygon>>, origin: Origin): Building[] {
   const records = new Map<string, Building>();
   features.forEach((feature, index) => {
     const properties = (feature.properties || {}) as Record<string, unknown>;
-    const rings = ringsFromMapFeature(feature);
+    const sourceLayer = String(properties.__sourceLayer || "building");
+    const rings = ringsFromOvertureFeature(feature);
     if (!rings.length) return;
-    const key = `${feature.sourceLayer || "building"}:${String(properties.id || feature.id || index)}`;
+    const key = `${sourceLayer}:${String(properties.id || feature.id || index)}`;
     const envelopes = rings
       .map((ring) => ring.map(([lon, lat]) => lngLatToLocal(Number(lon), Number(lat), origin)))
       .map((envelope) => envelope.length > 2 && envelope[0].x === envelope[envelope.length - 1].x && envelope[0].y === envelope[envelope.length - 1].y ? envelope.slice(0, -1) : envelope)
@@ -283,7 +308,7 @@ function visibleOvertureBuildings(map: MapLibreMap, origin: Origin): Building[] 
     const height = propertyHeight(properties);
     records.set(key, {
       id: key,
-      name: propertyName(properties, feature.sourceLayer === "building_part" ? "Building part" : "Building"),
+      name: propertyName(properties, sourceLayer === "building_part" ? "Building part" : "Building"),
       x: points.reduce((sum, value) => sum + value.x, 0) / points.length,
       y: points.reduce((sum, value) => sum + value.y, 0) / points.length,
       envelopes,
@@ -292,6 +317,15 @@ function visibleOvertureBuildings(map: MapLibreMap, origin: Origin): Building[] 
     });
   });
   return [...records.values()];
+}
+
+function tileX(lon: number, zoom: number) {
+  return Math.floor(((lon + 180) / 360) * (2 ** zoom));
+}
+
+function tileY(lat: number, zoom: number) {
+  const radians = Math.max(-85.05112878, Math.min(85.05112878, lat)) * Math.PI / 180;
+  return Math.floor(((1 - Math.asinh(Math.tan(radians)) / Math.PI) / 2) * (2 ** zoom));
 }
 
 function viewportStudyZone(map: MapLibreMap, origin: Origin): Zone {
@@ -317,6 +351,7 @@ export function AirspacePlanner() {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const overtureReloadRef = useRef<() => void>(() => {});
   const liveDataRef = useRef({ altitudeFt: 1800, buildings: [] as Building[], zones: [] as Zone[], origin: CHICAGO_ORIGIN, sourceMode: "overture" as "overture" | "local" });
   const [altitudeFt, setAltitudeFt] = useState(1800);
   const [buildings, setBuildings] = useState<Building[]>([]);
@@ -347,8 +382,9 @@ export function AirspacePlanner() {
   const conflictsGeoJson = useMemo(() => {
     if (altitudeFt < 1000) return featureCollection(zones.map((zone) => zoneFeature(zone, origin)));
     const features: Array<Feature<Polygon | MultiPolygon>> = [];
-    buildings.forEach((building) => {
-      if (altitudeFt >= building.heightFt + 1000) return;
+    const active = buildings.filter((building) => altitudeFt < building.heightFt + 1000);
+    const displayBuildings = active.length > 500 ? groupDenseBuildings(active) : active;
+    displayBuildings.forEach((building) => {
       const expanded = buffer(buildingFeature(building, origin), 2000, { units: "feet", steps: 12 });
       if (!expanded) return;
       zones.forEach((zone) => {
@@ -365,21 +401,20 @@ export function AirspacePlanner() {
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) return;
     let disposed = false;
-    let removePmtilesProtocol: (() => void) | undefined;
+    let loadSerial = 0;
     Promise.all([
       import("maplibre-gl"),
       import("pmtiles"),
+      import("@mapbox/vector-tile"),
+      import("pbf"),
       fetch(OVERTURE_CATALOG_URL).then((response) => response.ok ? response.json() : null).catch(() => null),
-    ]).then(([maplibregl, { PMTiles, Protocol }, catalog]) => {
+    ]).then(([maplibregl, { PMTiles }, { VectorTile }, { PbfReader }, catalog]) => {
       if (disposed || !mapContainerRef.current) return;
       const release = typeof catalog?.latest === "string" ? catalog.latest : OVERTURE_FALLBACK_RELEASE;
       const tilesUrl = `https://overturemaps-extras-us-west-2.s3.us-west-2.amazonaws.com/tiles/${release}/buildings.pmtiles`;
       setOvertureRelease(release);
       setDatasetName(`Overture Maps · ${release}`);
-      const protocol = new Protocol();
-      maplibregl.addProtocol("pmtiles", protocol.tile);
-      protocol.add(new PMTiles(tilesUrl));
-      removePmtilesProtocol = () => maplibregl.removeProtocol("pmtiles");
+      const archive = new PMTiles(tilesUrl);
       const map = new maplibregl.Map({
         container: mapContainerRef.current,
         style: "https://tiles.openfreemap.org/styles/positron",
@@ -390,66 +425,136 @@ export function AirspacePlanner() {
         attributionControl: {},
       });
       mapRef.current = map;
-      map.on("load", () => {
-        const beforeId = map.getStyle().layers?.find((layer) => layer.type === "symbol")?.id;
-        map.addSource("overture-buildings", {
-          type: "vector",
-          url: `pmtiles://${tilesUrl}`,
-          attribution: '<a href="https://docs.overturemaps.org/attribution" target="_blank">© Overture Maps Foundation</a>',
-        });
-        map.addSource("clearance-zones", { type: "geojson", data: emptyFeatures() });
-        map.addSource("clearance-conflicts", { type: "geojson", data: emptyFeatures() });
-        map.addSource("clearance-buildings", { type: "geojson", data: emptyFeatures() });
-        map.addSource("clearance-selected", { type: "geojson", data: emptyFeatures() });
-        map.addLayer({ id: "clearance-zone-fill", type: "fill", source: "clearance-zones", paint: { "fill-color": "#c08a2c", "fill-opacity": 0.07 } }, beforeId);
-        map.addLayer({ id: "clearance-zone-line", type: "line", source: "clearance-zones", paint: { "line-color": "#8f6b28", "line-width": 1.25, "line-dasharray": [3, 2] } }, beforeId);
-        map.addLayer({ id: "clearance-conflict-fill", type: "fill", source: "clearance-conflicts", paint: { "fill-color": "#df3d33", "fill-opacity": 0.25 } }, beforeId);
-        map.addLayer({ id: "clearance-conflict-line", type: "line", source: "clearance-conflicts", paint: { "line-color": "#bd3028", "line-width": 1 } }, beforeId);
-        map.addLayer({ id: "overture-building-fill", type: "fill", source: "overture-buildings", "source-layer": "building", minzoom: 12.5, paint: { "fill-color": ["step", ["coalesce", ["get", "height"], 9], "#89908e", 107, "#4e585c", 244, "#182229"], "fill-opacity": 0.84 } }, beforeId);
-        map.addLayer({ id: "overture-building-part-fill", type: "fill", source: "overture-buildings", "source-layer": "building_part", minzoom: 12.5, paint: { "fill-color": ["step", ["coalesce", ["get", "height"], 9], "#7f8886", 107, "#465156", 244, "#111b21"], "fill-opacity": 0.9 } }, beforeId);
-        map.addLayer({ id: "overture-building-line", type: "line", source: "overture-buildings", "source-layer": "building", minzoom: 12.5, paint: { "line-color": "#ffffff", "line-width": 0.65, "line-opacity": 0.72 } }, beforeId);
-        map.addLayer({ id: "clearance-building-fill", type: "fill", source: "clearance-buildings", paint: { "fill-color": ["step", ["get", "heightFt"], "#89908e", 350, "#4e585c", 800, "#182229"], "fill-opacity": 0.9 } }, beforeId);
-        map.addLayer({ id: "clearance-building-line", type: "line", source: "clearance-buildings", paint: { "line-color": "#ffffff", "line-width": 0.65, "line-opacity": 0.72 } }, beforeId);
-        map.addLayer({ id: "clearance-selected-outer", type: "circle", source: "clearance-selected", paint: { "circle-radius": 10, "circle-color": "#fffdf7", "circle-stroke-width": 4, "circle-stroke-color": ["match", ["get", "state"], "conflict", "#d82f29", "clear", "#176b59", "#182229"] } });
-        map.addLayer({ id: "clearance-selected-inner", type: "circle", source: "clearance-selected", paint: { "circle-radius": 3, "circle-color": ["match", ["get", "state"], "conflict", "#d82f29", "clear", "#176b59", "#182229"] } });
-        setMapReady(true);
-      });
-      const syncVisibleBuildings = () => {
+
+      const loadVisibleBuildingTiles = async () => {
         if (liveDataRef.current.sourceMode !== "overture" || !map.getSource("overture-buildings")) return;
+        const requestId = ++loadSerial;
         const center = map.getCenter();
         const nextOrigin = { lat: center.lat, lon: center.lng };
+        const source = map.getSource("overture-buildings") as GeoJSONSource;
         if (map.getZoom() < 12.5) {
+          source.setData(emptyFeatures());
           setOrigin(nextOrigin);
           setBuildings([]);
           setZones([viewportStudyZone(map, nextOrigin)]);
           setDataNote("Zoom to neighborhood level to load building envelopes");
           return;
         }
-        const visible = visibleOvertureBuildings(map, nextOrigin);
-        if (!visible.length) return;
-        const measured = visible.filter((building) => building.heightSource !== "30 ft fallback").length;
-        setOrigin(nextOrigin);
-        setBuildings(visible);
-        setZones([viewportStudyZone(map, nextOrigin)]);
-        setDatasetName(`Overture Maps · ${release}`);
-        setDataNote(`${visible.length.toLocaleString()} visible envelopes · ${measured.toLocaleString()} with height/floor data`);
+        const zoom = map.getZoom() >= 13.5 ? 14 : 13;
+        const bounds = map.getBounds();
+        const maxTile = (2 ** zoom) - 1;
+        const minX = Math.max(0, Math.min(maxTile, tileX(bounds.getWest(), zoom)));
+        const maxX = Math.max(0, Math.min(maxTile, tileX(bounds.getEast(), zoom)));
+        const minY = Math.max(0, Math.min(maxTile, tileY(bounds.getNorth(), zoom)));
+        const maxY = Math.max(0, Math.min(maxTile, tileY(bounds.getSouth(), zoom)));
+        const coordinates: Array<{ x: number; y: number }> = [];
+        for (let x = minX; x <= maxX; x += 1) {
+          for (let y = minY; y <= maxY; y += 1) coordinates.push({ x, y });
+        }
+        if (!coordinates.length || coordinates.length > 24) {
+          source.setData(emptyFeatures());
+          setBuildings([]);
+          setDataNote("Zoom in to load a smaller set of building tiles");
+          return;
+        }
+        setDataNote(`Loading ${coordinates.length} visible Overture tile${coordinates.length === 1 ? "" : "s"}…`);
+        try {
+          const tiles = await Promise.all(coordinates.map(async ({ x, y }) => ({ x, y, tile: await archive.getZxy(zoom, x, y) })));
+          if (disposed || requestId !== loadSerial) return;
+          const decoded: Array<Feature<Polygon | MultiPolygon>> = [];
+          tiles.forEach(({ x, y, tile }) => {
+            if (!tile) return;
+            const vectorTile = new VectorTile(new PbfReader(new Uint8Array(tile.data)));
+            (["building", "building_part"] as const).forEach((sourceLayer) => {
+              const layer = vectorTile.layers[sourceLayer];
+              if (!layer) return;
+              for (let index = 0; index < layer.length; index += 1) {
+                const vectorFeature = layer.feature(index);
+                const geojson = vectorFeature.toGeoJSON(x, y, zoom);
+                if (geojson.geometry.type !== "Polygon" && geojson.geometry.type !== "MultiPolygon") continue;
+                const raw = (geojson.properties || {}) as Record<string, unknown>;
+                const height = propertyHeight(raw);
+                geojson.properties = {
+                  id: raw.id || vectorFeature.id || `${zoom}/${x}/${y}/${sourceLayer}/${index}`,
+                  name: raw.name,
+                  "@name": raw["@name"],
+                  names: raw.names,
+                  height: raw.height,
+                  height_m: raw.height_m,
+                  height_ft: raw.height_ft,
+                  num_floors: raw.num_floors,
+                  "building:levels": raw["building:levels"],
+                  __sourceLayer: sourceLayer,
+                  __renderHeightM: height.feet / 3.28084,
+                };
+                decoded.push(geojson as Feature<Polygon | MultiPolygon>);
+              }
+            });
+          });
+          const nextBuildings = overtureBuildingsFromFeatures(decoded, nextOrigin);
+          const measured = nextBuildings.filter((building) => building.heightSource !== "30 ft fallback").length;
+          source.setData(featureCollection(decoded));
+          setOrigin(nextOrigin);
+          setBuildings(nextBuildings);
+          setZones([viewportStudyZone(map, nextOrigin)]);
+          setDatasetName(`Overture Maps · ${release}`);
+          setDataNote(`${nextBuildings.length.toLocaleString()} visible envelopes · ${measured.toLocaleString()} with height/floor data`);
+        } catch (error) {
+          console.error("Overture building tile load failed", error);
+          if (!disposed && requestId === loadSerial) setDataNote("Overture building tiles could not be reached. Reload to try again.");
+        }
       };
-      map.on("idle", syncVisibleBuildings);
-      map.on("moveend", syncVisibleBuildings);
+      overtureReloadRef.current = () => { void loadVisibleBuildingTiles(); };
+
+      map.on("style.load", () => {
+        setMapReady(true);
+        setBasemapError(false);
+        setDataNote("Connecting to Overture building archive…");
+        requestAnimationFrame(async () => {
+          try {
+            await archive.getHeader();
+            const beforeId = map.getStyle().layers?.find((layer) => layer.type === "symbol")?.id;
+            map.addSource("overture-buildings", { type: "geojson", data: emptyFeatures(), attribution: '<a href="https://docs.overturemaps.org/attribution" target="_blank">© Overture Maps Foundation</a>' });
+            map.addSource("clearance-zones", { type: "geojson", data: emptyFeatures() });
+            map.addSource("clearance-conflicts", { type: "geojson", data: emptyFeatures() });
+            map.addSource("clearance-buildings", { type: "geojson", data: emptyFeatures() });
+            map.addSource("clearance-selected", { type: "geojson", data: emptyFeatures() });
+            map.addLayer({ id: "clearance-zone-fill", type: "fill", source: "clearance-zones", paint: { "fill-color": "#c08a2c", "fill-opacity": 0.07 } }, beforeId);
+            map.addLayer({ id: "clearance-zone-line", type: "line", source: "clearance-zones", paint: { "line-color": "#8f6b28", "line-width": 1.25, "line-dasharray": [3, 2] } }, beforeId);
+            map.addLayer({ id: "clearance-conflict-fill", type: "fill", source: "clearance-conflicts", paint: { "fill-color": "#df3d33", "fill-opacity": 0.25 } }, beforeId);
+            map.addLayer({ id: "clearance-conflict-line", type: "line", source: "clearance-conflicts", paint: { "line-color": "#bd3028", "line-width": 1 } }, beforeId);
+            map.addLayer({ id: "overture-building-fill", type: "fill", source: "overture-buildings", minzoom: 12.5, filter: ["==", ["get", "__sourceLayer"], "building"], paint: { "fill-color": ["step", ["get", "__renderHeightM"], "#89908e", 107, "#4e585c", 244, "#182229"], "fill-opacity": 0.84 } }, beforeId);
+            map.addLayer({ id: "overture-building-part-fill", type: "fill", source: "overture-buildings", minzoom: 12.5, filter: ["==", ["get", "__sourceLayer"], "building_part"], paint: { "fill-color": ["step", ["get", "__renderHeightM"], "#7f8886", 107, "#465156", 244, "#111b21"], "fill-opacity": 0.9 } }, beforeId);
+            map.addLayer({ id: "overture-building-line", type: "line", source: "overture-buildings", minzoom: 12.5, filter: ["==", ["get", "__sourceLayer"], "building"], paint: { "line-color": "#ffffff", "line-width": 0.65, "line-opacity": 0.72 } }, beforeId);
+            map.addLayer({ id: "clearance-building-fill", type: "fill", source: "clearance-buildings", paint: { "fill-color": ["step", ["get", "heightFt"], "#89908e", 350, "#4e585c", 800, "#182229"], "fill-opacity": 0.9 } }, beforeId);
+            map.addLayer({ id: "clearance-building-line", type: "line", source: "clearance-buildings", paint: { "line-color": "#ffffff", "line-width": 0.65, "line-opacity": 0.72 } }, beforeId);
+            map.addLayer({ id: "clearance-selected-outer", type: "circle", source: "clearance-selected", paint: { "circle-radius": 10, "circle-color": "#fffdf7", "circle-stroke-width": 4, "circle-stroke-color": ["match", ["get", "state"], "conflict", "#d82f29", "clear", "#176b59", "#182229"] } });
+            map.addLayer({ id: "clearance-selected-inner", type: "circle", source: "clearance-selected", paint: { "circle-radius": 3, "circle-color": ["match", ["get", "state"], "conflict", "#d82f29", "clear", "#176b59", "#182229"] } });
+            void loadVisibleBuildingTiles();
+          } catch (error) {
+            console.error("Clearance map layer setup failed", error);
+            setDataNote("Overture building archive could not be reached. Reload to try again.");
+          }
+        });
+      });
+      map.on("moveend", () => { void loadVisibleBuildingTiles(); });
       map.on("click", (event) => {
         setSelectedLngLat([event.lngLat.lng, event.lngLat.lat]);
       });
-      map.on("error", () => {
-        if (!map.loaded()) setBasemapError(true);
+      map.on("error", (event) => {
+        const message = event.error?.message || "Unknown map error";
+        console.error("Clearance map error", message);
+        if (!map.isStyleLoaded()) setBasemapError(true);
       });
     }).catch(() => {
       if (!disposed) setBasemapError(true);
     });
     return () => {
       disposed = true;
+      loadSerial += 1;
+      overtureReloadRef.current = () => {};
       mapRef.current?.remove();
       mapRef.current = null;
-      removePmtilesProtocol?.();
     };
   }, []);
 
@@ -459,9 +564,17 @@ export function AirspacePlanner() {
     (mapRef.current.getSource("clearance-conflicts") as GeoJSONSource)?.setData(conflictsGeoJson);
     (mapRef.current.getSource("clearance-buildings") as GeoJSONSource)?.setData(sourceMode === "local" ? buildingsGeoJson : emptyFeatures());
     (mapRef.current.getSource("clearance-selected") as GeoJSONSource)?.setData(selectedGeoJson);
-    ["clearance-building-fill", "clearance-building-line"].forEach((id) => mapRef.current?.setLayoutProperty(id, "visibility", sourceMode === "local" ? "visible" : "none"));
-    ["overture-building-fill", "overture-building-part-fill", "overture-building-line"].forEach((id) => mapRef.current?.setLayoutProperty(id, "visibility", sourceMode === "overture" ? "visible" : "none"));
+    ["clearance-building-fill", "clearance-building-line"].forEach((id) => {
+      if (mapRef.current?.getLayer(id)) mapRef.current.setLayoutProperty(id, "visibility", sourceMode === "local" ? "visible" : "none");
+    });
+    ["overture-building-fill", "overture-building-part-fill", "overture-building-line"].forEach((id) => {
+      if (mapRef.current?.getLayer(id)) mapRef.current.setLayoutProperty(id, "visibility", sourceMode === "overture" ? "visible" : "none");
+    });
   }, [mapReady, zonesGeoJson, conflictsGeoJson, buildingsGeoJson, selectedGeoJson, sourceMode]);
+
+  useEffect(() => {
+    if (mapReady && sourceMode === "overture") overtureReloadRef.current();
+  }, [mapReady, sourceMode]);
 
   async function handleImport(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
@@ -590,6 +703,7 @@ export function AirspacePlanner() {
           <span className="modal-kicker">MODEL NOTES</span>
           <h2 id="limitations-title">Full envelopes, with important limits.</h2>
           <p>GeoJSON Polygon and MultiPolygon outer footprints are preserved. The red geometry begins at the closest footprint edge, buffers it by 2,000 feet, and compares the selected altitude with the building height plus 1,000 feet.</p>
+          <p>When more than 500 obstacles are active in one view, nearby envelopes are conservatively grouped for the red overlay so the altitude control stays responsive. The selected-point check still tests the individual building envelopes.</p>
           <p>The FAA evaluates whether an area is “congested” case by case. The visible map extent is treated as a conservative study area—not labeled as an official FAA boundary.</p>
           <div className="modal-warning"><b>Small UAS note</b><span>Part 107 generally uses a different 400-foot AGL framework and may require airspace authorization. This prototype models the Part 91 rule named above.</span></div>
           <div className="source-detail">

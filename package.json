@@ -14,11 +14,13 @@
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
+    "@mapbox/vector-tile": "^3.0.0",
     "@turf/buffer": "^7.4.0",
     "@turf/helpers": "^7.4.0",
     "@turf/intersect": "^7.4.0",
     "drizzle-orm": "0.45.2",
     "maplibre-gl": "^6.2.0",
+    "pbf": "^5.1.2",
     "pmtiles": "^4.4.1",
     "react": "19.2.6",
     "react-dom": "19.2.6"
