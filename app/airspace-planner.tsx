@@ -361,6 +361,9 @@ export function AirspacePlanner() {
   const inputRef = useRef<HTMLInputElement>(null);
   const overtureReloadRef = useRef<() => void>(() => {});
   const coverageBoundsRef = useRef<{ west: number; east: number; south: number; north: number } | null>(null);
+  const loadedTileKeyRef = useRef<string | null>(null);
+  const loadedViewportKeyRef = useRef<string | null>(null);
+  const pendingTileKeyRef = useRef<string | null>(null);
   const liveDataRef = useRef({ altitudeFt: 1800, buildings: [] as Building[], zones: [] as Zone[], origin: CHICAGO_ORIGIN, sourceMode: "overture" as "overture" | "local" });
   const [altitudeFt, setAltitudeFt] = useState(1800);
   const [buildings, setBuildings] = useState<Building[]>([]);
@@ -457,11 +460,16 @@ export function AirspacePlanner() {
 
       const loadVisibleBuildingTiles = async () => {
         if (liveDataRef.current.sourceMode !== "overture" || !map.getSource("overture-buildings")) return;
-        const requestId = ++loadSerial;
         const center = map.getCenter();
         const nextOrigin = { lat: center.lat, lon: center.lng };
         const source = map.getSource("overture-buildings") as GeoJSONSource;
         const viewportBounds = map.getBounds();
+        const viewportKey = [
+          viewportBounds.getWest(),
+          viewportBounds.getSouth(),
+          viewportBounds.getEast(),
+          viewportBounds.getNorth(),
+        ].map((value) => value.toFixed(6)).join(":");
         const previousCoverage = coverageBoundsRef.current;
         const viewportAlreadyCovered = Boolean(previousCoverage
           && viewportBounds.getWest() >= previousCoverage.west
@@ -469,13 +477,16 @@ export function AirspacePlanner() {
           && viewportBounds.getSouth() >= previousCoverage.south
           && viewportBounds.getNorth() <= previousCoverage.north);
         const clearCoverage = () => {
+          loadSerial += 1;
           coverageBoundsRef.current = null;
+          loadedTileKeyRef.current = null;
+          loadedViewportKeyRef.current = null;
+          pendingTileKeyRef.current = null;
           source.setData(emptyFeatures());
           setOrigin(nextOrigin);
           setBuildings([]);
           setZones([viewportStudyZone(map, nextOrigin)]);
         };
-        setCoverageStatus(viewportAlreadyCovered ? "ready" : "loading");
         if (map.getZoom() < 12.5) {
           clearCoverage();
           setCoverageStatus("zoom-required");
@@ -498,6 +509,26 @@ export function AirspacePlanner() {
           setDataNote("Zoom in to load a smaller set of building tiles");
           return;
         }
+        const tileKey = `${release}:${coordinates.map(({ x, y }) => `${zoom}/${x}/${y}`).join("|")}`;
+        if (loadedTileKeyRef.current === tileKey) {
+          if (loadedViewportKeyRef.current !== viewportKey) {
+            const stableOrigin = liveDataRef.current.origin;
+            setZones([viewportStudyZone(map, stableOrigin)]);
+            coverageBoundsRef.current = {
+              west: viewportBounds.getWest(),
+              east: viewportBounds.getEast(),
+              south: viewportBounds.getSouth(),
+              north: viewportBounds.getNorth(),
+            };
+            loadedViewportKeyRef.current = viewportKey;
+          }
+          setCoverageStatus("ready");
+          return;
+        }
+        if (pendingTileKeyRef.current === tileKey) return;
+        const requestId = ++loadSerial;
+        pendingTileKeyRef.current = tileKey;
+        setCoverageStatus(viewportAlreadyCovered ? "ready" : "loading");
         setDataNote(`Loading ${coordinates.length} visible Overture tile${coordinates.length === 1 ? "" : "s"}…`);
         try {
           const tiles = await Promise.all(coordinates.map(async ({ x, y }) => ({ x, y, tile: await archive.getZxy(zoom, x, y) })));
@@ -543,6 +574,9 @@ export function AirspacePlanner() {
           setOrigin(nextOrigin);
           setBuildings(nextBuildings);
           setZones([viewportStudyZone(map, nextOrigin)]);
+          loadedTileKeyRef.current = tileKey;
+          loadedViewportKeyRef.current = viewportKey;
+          pendingTileKeyRef.current = null;
           coverageBoundsRef.current = {
             west: viewportBounds.getWest(),
             east: viewportBounds.getEast(),
@@ -555,6 +589,7 @@ export function AirspacePlanner() {
         } catch (error) {
           console.error("Overture building tile load failed", error);
           if (!disposed && requestId === loadSerial) {
+            pendingTileKeyRef.current = null;
             if (viewportAlreadyCovered) {
               setCoverageStatus("ready");
               setDataNote("Using previously loaded coverage · refresh unavailable");
@@ -617,6 +652,9 @@ export function AirspacePlanner() {
       disposed = true;
       loadSerial += 1;
       overtureReloadRef.current = () => {};
+      loadedTileKeyRef.current = null;
+      loadedViewportKeyRef.current = null;
+      pendingTileKeyRef.current = null;
       mapRef.current?.remove();
       mapRef.current = null;
     };
@@ -650,6 +688,9 @@ export function AirspacePlanner() {
       if (!imported.buildings.length) throw new Error("No usable building records were found.");
       setSourceMode("local");
       coverageBoundsRef.current = null;
+      loadedTileKeyRef.current = null;
+      loadedViewportKeyRef.current = null;
+      pendingTileKeyRef.current = null;
       setCoverageStatus("ready");
       setBuildings(imported.buildings);
       setOrigin(imported.origin);
@@ -670,6 +711,9 @@ export function AirspacePlanner() {
     const nextOrigin = center ? { lat: center.lat, lon: center.lng } : CHICAGO_ORIGIN;
     setSourceMode("overture");
     coverageBoundsRef.current = null;
+    loadedTileKeyRef.current = null;
+    loadedViewportKeyRef.current = null;
+    pendingTileKeyRef.current = null;
     setCoverageStatus("loading");
     setBuildings([]);
     setOrigin(nextOrigin);
