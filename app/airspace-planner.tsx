@@ -417,7 +417,18 @@ export function AirspacePlanner() {
       const archive = new PMTiles(tilesUrl);
       const map = new maplibregl.Map({
         container: mapContainerRef.current,
-        style: "https://tiles.openfreemap.org/styles/positron",
+        style: {
+          version: 8,
+          sources: {
+            "carto-positron": {
+              type: "raster",
+              tiles: ["https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}@2x.png"],
+              tileSize: 256,
+              attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions" target="_blank">CARTO</a>',
+            },
+          },
+          layers: [{ id: "carto-positron", type: "raster", source: "carto-positron", minzoom: 0, maxzoom: 22 }],
+        },
         center: [CHICAGO_ORIGIN.lon, CHICAGO_ORIGIN.lat],
         zoom: 14.2,
         pitch: 0,
@@ -689,7 +700,7 @@ export function AirspacePlanner() {
           </div>
           <div className="legend" aria-label="Map legend"><span><i className="legend-red" />Envelope conflict</span><span><i className="legend-amber" />Study polygon</span><span><i className="legend-building" />Building envelope</span></div>
           <div className="dataset-card"><span className="dataset-icon" aria-hidden="true">▤</span><span><small>{sourceMode === "overture" ? "AUTOMATIC BUILDING LAYER" : "LOCAL OVERRIDE"}</small><strong>{datasetName}</strong><em>{dataNote}</em></span>{sourceMode === "local" ? <button onClick={activateOverture}>Use Overture</button> : <span className="data-live">LIVE</span>}</div>
-          <div className="basemap-badge">BASEMAP · OPENFREEMAP / OPENSTREETMAP</div>
+          <div className="basemap-badge">BASEMAP · CARTO / OPENSTREETMAP</div>
         </section>
       </section>
 
@@ -712,7 +723,7 @@ export function AirspacePlanner() {
             <a href="https://docs.overturemaps.org/guides/buildings/" target="_blank" rel="noreferrer">Open Overture Buildings guide ↗</a>
           </div>
           <div className="file-help"><h3>Advanced local override</h3><p>GeoJSON: use <code>height_ft</code>, Overture <code>height</code> (meters), <code>height_m</code>, <code>num_floors</code>, or <code>building:levels</code>. CSV: include <code>lat, lon, height_ft, width_ft, depth_ft</code>.</p><div className="file-actions"><button onClick={() => inputRef.current?.click()}>Import local file</button><button onClick={downloadTemplate}>Download CSV template</button>{sourceMode === "local" && <button onClick={activateOverture}>Return to Overture</button>}</div></div>
-          <div className="modal-links"><a href="https://www.faa.gov/about/office_org/headquarters_offices/agc/practice_areas/regulations/interpretations/Data/interps/2009/Anderson_2009_Legal_Interpretation.pdf" target="_blank" rel="noreferrer">FAA Anderson interpretation ↗</a><a href="https://openfreemap.org/quick_start/" target="_blank" rel="noreferrer">Basemap source ↗</a></div>
+          <div className="modal-links"><a href="https://www.faa.gov/about/office_org/headquarters_offices/agc/practice_areas/regulations/interpretations/Data/interps/2009/Anderson_2009_Legal_Interpretation.pdf" target="_blank" rel="noreferrer">FAA Anderson interpretation ↗</a><a href="https://carto.com/basemaps/" target="_blank" rel="noreferrer">Basemap source ↗</a></div>
         </section>
       </div>}
     </main>
