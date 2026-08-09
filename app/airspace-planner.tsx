@@ -11,7 +11,7 @@ import {
   useRef,
   useState,
 } from "react";
-import type { GeoJSONSource, Map as MapLibreMap } from "maplibre-gl";
+import type { GeoJSONSource, Map as MapLibreMap, MapGeoJSONFeature } from "maplibre-gl";
 
 type Point = { x: number; y: number };
 type Origin = { lat: number; lon: number };
@@ -34,43 +34,10 @@ type Check = {
 type ImportedDataset = { buildings: Building[]; origin: Origin; note: string };
 
 const CHICAGO_ORIGIN: Origin = { lat: 41.8819, lon: -87.6324 };
+const OVERTURE_FALLBACK_RELEASE = "2026-07-22.0";
+const OVERTURE_CATALOG_URL = "https://stac.overturemaps.org/catalog.json";
 const FEET_PER_LAT_DEGREE = 364_000;
 const feetPerLonDegree = (latitude: number) => 364_000 * Math.cos((latitude * Math.PI) / 180);
-
-const SAMPLE_ZONES: Zone[] = [
-  {
-    id: "loop",
-    label: "Loop / Near South Side",
-    source: "Sample planning polygon",
-    points: [
-      { x: -3600, y: -2650 }, { x: 2700, y: -2700 }, { x: 3300, y: -250 },
-      { x: 2450, y: 2850 }, { x: -3300, y: 2800 }, { x: -4050, y: 250 },
-    ],
-  },
-  {
-    id: "river-north",
-    label: "River North",
-    source: "Sample planning polygon",
-    points: [
-      { x: -3450, y: -4300 }, { x: 2500, y: -4300 },
-      { x: 2750, y: -2850 }, { x: -3600, y: -2700 },
-    ],
-  },
-  {
-    id: "west-loop",
-    label: "West Loop",
-    source: "Sample planning polygon",
-    points: [
-      { x: -6150, y: -2300 }, { x: -3700, y: -2250 },
-      { x: -3250, y: 2300 }, { x: -6100, y: 2450 },
-    ],
-  },
-];
-
-function seeded(seed: number) {
-  const value = Math.sin(seed * 12.9898) * 43758.5453;
-  return value - Math.floor(value);
-}
 
 function rectangleEnvelope(x: number, y: number, width: number, depth: number): Point[] {
   return [
@@ -80,53 +47,6 @@ function rectangleEnvelope(x: number, y: number, width: number, depth: number): 
     { x: x - width / 2, y: y + depth / 2 },
   ];
 }
-
-function sampleBuilding(
-  id: string,
-  name: string,
-  x: number,
-  y: number,
-  width: number,
-  depth: number,
-  heightFt: number,
-): Building {
-  return { id, name, x, y, envelopes: [rectangleEnvelope(x, y, width, depth)], heightFt, heightSource: "Sample height" };
-}
-
-function makeSampleBuildings(): Building[] {
-  const buildings: Building[] = [];
-  let index = 0;
-  for (let gx = -7; gx <= 4; gx += 1) {
-    for (let gy = -5; gy <= 4; gy += 1) {
-      const blockX = gx * 720;
-      const blockY = gy * 720;
-      const distance = Math.hypot(blockX + 200, blockY + 300);
-      const downtownFactor = Math.max(0, 1 - distance / 5600);
-      const slots = seeded(index + 14) > 0.32 ? 4 : 3;
-      for (let slot = 0; slot < slots; slot += 1) {
-        const col = slot % 2;
-        const row = Math.floor(slot / 2);
-        const jitter = seeded(index * 8 + slot + 2);
-        const x = blockX + (col ? 155 : -145) + (jitter - 0.5) * 55;
-        const y = blockY + (row ? 150 : -150) + (seeded(index + slot + 80) - 0.5) * 55;
-        const width = 150 + seeded(index + slot + 33) * 145;
-        const depth = 130 + seeded(index + slot + 91) * 150;
-        const heightFt = Math.round(45 + downtownFactor * downtownFactor * (170 + seeded(index + slot + 55) * 640));
-        buildings.push(sampleBuilding(`b-${index}-${slot}`, `Building ${index + 1}${String.fromCharCode(65 + slot)}`, x, y, width, depth, heightFt));
-      }
-      index += 1;
-    }
-  }
-  buildings.push(
-    sampleBuilding("willis", "Willis Tower", -970, 690, 330, 280, 1451),
-    sampleBuilding("aon", "Aon Center", 890, -410, 270, 260, 1136),
-    sampleBuilding("trump", "Trump International", 390, -1390, 240, 230, 1170),
-    sampleBuilding("hancock", "875 N Michigan", 1480, -3380, 290, 290, 1128),
-  );
-  return buildings;
-}
-
-const SAMPLE_BUILDINGS = makeSampleBuildings();
 
 function localToLngLat(value: Point, origin: Origin): [number, number] {
   return [origin.lon + value.x / feetPerLonDegree(origin.lat), origin.lat - value.y / FEET_PER_LAT_DEGREE];
@@ -227,6 +147,7 @@ function makeConservativeZone(buildings: Building[], label: string): Zone {
 }
 
 function propertyName(properties: Record<string, unknown>, fallback: string) {
+  if (typeof properties["@name"] === "string" && properties["@name"]) return String(properties["@name"]);
   if (typeof properties.name === "string") return properties.name;
   const names = properties.names as { primary?: string; common?: Record<string, string> } | undefined;
   return names?.primary || names?.common?.en || fallback;
@@ -334,26 +255,89 @@ function estimateFlaggedSquareMiles(altitudeFt: number, buildings: Building[], z
 
 const emptyFeatures = (): FeatureCollection => featureCollection([]);
 
+function ringsFromMapFeature(feature: MapGeoJSONFeature): number[][][] {
+  if (feature.geometry.type === "Polygon") return [(feature.geometry.coordinates as number[][][])[0]];
+  if (feature.geometry.type === "MultiPolygon") return (feature.geometry.coordinates as number[][][][]).map((candidate) => candidate[0]);
+  return [];
+}
+
+function visibleOvertureBuildings(map: MapLibreMap, origin: Origin): Building[] {
+  const features = map.queryRenderedFeatures({ layers: ["overture-building-fill", "overture-building-part-fill"] });
+  const records = new Map<string, Building>();
+  features.forEach((feature, index) => {
+    const properties = (feature.properties || {}) as Record<string, unknown>;
+    const rings = ringsFromMapFeature(feature);
+    if (!rings.length) return;
+    const key = `${feature.sourceLayer || "building"}:${String(properties.id || feature.id || index)}`;
+    const envelopes = rings
+      .map((ring) => ring.map(([lon, lat]) => lngLatToLocal(Number(lon), Number(lat), origin)))
+      .map((envelope) => envelope.length > 2 && envelope[0].x === envelope[envelope.length - 1].x && envelope[0].y === envelope[envelope.length - 1].y ? envelope.slice(0, -1) : envelope)
+      .filter((envelope) => envelope.length >= 3);
+    if (!envelopes.length) return;
+    const existing = records.get(key);
+    if (existing) {
+      existing.envelopes.push(...envelopes);
+      return;
+    }
+    const points = envelopes.flat();
+    const height = propertyHeight(properties);
+    records.set(key, {
+      id: key,
+      name: propertyName(properties, feature.sourceLayer === "building_part" ? "Building part" : "Building"),
+      x: points.reduce((sum, value) => sum + value.x, 0) / points.length,
+      y: points.reduce((sum, value) => sum + value.y, 0) / points.length,
+      envelopes,
+      heightFt: Math.round(height.feet),
+      heightSource: height.source,
+    });
+  });
+  return [...records.values()];
+}
+
+function viewportStudyZone(map: MapLibreMap, origin: Origin): Zone {
+  const bounds = map.getBounds();
+  const west = bounds.getWest();
+  const east = bounds.getEast();
+  const south = bounds.getSouth();
+  const north = bounds.getNorth();
+  return {
+    id: "visible-study-area",
+    label: "Visible conservative study area",
+    source: "Current viewport; not an FAA designation",
+    points: [
+      lngLatToLocal(west, north, origin),
+      lngLatToLocal(east, north, origin),
+      lngLatToLocal(east, south, origin),
+      lngLatToLocal(west, south, origin),
+    ],
+  };
+}
+
 export function AirspacePlanner() {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const liveDataRef = useRef({ altitudeFt: 1800, buildings: SAMPLE_BUILDINGS, zones: SAMPLE_ZONES, origin: CHICAGO_ORIGIN });
+  const liveDataRef = useRef({ altitudeFt: 1800, buildings: [] as Building[], zones: [] as Zone[], origin: CHICAGO_ORIGIN, sourceMode: "overture" as "overture" | "local" });
   const [altitudeFt, setAltitudeFt] = useState(1800);
-  const [buildings, setBuildings] = useState<Building[]>(SAMPLE_BUILDINGS);
-  const [zones, setZones] = useState<Zone[]>(SAMPLE_ZONES);
+  const [buildings, setBuildings] = useState<Building[]>([]);
+  const [zones, setZones] = useState<Zone[]>([]);
   const [origin, setOrigin] = useState<Origin>(CHICAGO_ORIGIN);
-  const [datasetName, setDatasetName] = useState("Downtown Chicago · sample");
-  const [dataNote, setDataNote] = useState(`${SAMPLE_BUILDINGS.length} envelope records · 3 study polygons`);
-  const [selected, setSelected] = useState<Point>({ x: 80, y: 160 });
+  const [datasetName, setDatasetName] = useState("Overture Maps · automatic");
+  const [dataNote, setDataNote] = useState("Loading visible building tiles…");
+  const [sourceMode, setSourceMode] = useState<"overture" | "local">("overture");
+  const [overtureRelease, setOvertureRelease] = useState(OVERTURE_FALLBACK_RELEASE);
+  const [selectedLngLat, setSelectedLngLat] = useState<[number, number]>(localToLngLat({ x: 80, y: 160 }, CHICAGO_ORIGIN));
   const [importError, setImportError] = useState("");
   const [infoOpen, setInfoOpen] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [mapReady, setMapReady] = useState(false);
   const [basemapError, setBasemapError] = useState(false);
 
-  liveDataRef.current = { altitudeFt, buildings, zones, origin };
+  useEffect(() => {
+    liveDataRef.current = { altitudeFt, buildings, zones, origin, sourceMode };
+  }, [altitudeFt, buildings, zones, origin, sourceMode]);
 
+  const selected = useMemo(() => lngLatToLocal(selectedLngLat[0], selectedLngLat[1], origin), [selectedLngLat, origin]);
   const check = useMemo(() => evaluatePoint(selected, altitudeFt, buildings, zones), [selected, altitudeFt, buildings, zones]);
   const activeObstacles = useMemo(() => buildings.filter((building) => altitudeFt < building.heightFt + 1000).length, [altitudeFt, buildings]);
   const flaggedSquareMiles = useMemo(() => estimateFlaggedSquareMiles(altitudeFt, buildings, zones), [altitudeFt, buildings, zones]);
@@ -381,8 +365,21 @@ export function AirspacePlanner() {
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) return;
     let disposed = false;
-    import("maplibre-gl").then(({ default: maplibregl }) => {
+    let removePmtilesProtocol: (() => void) | undefined;
+    Promise.all([
+      import("maplibre-gl"),
+      import("pmtiles"),
+      fetch(OVERTURE_CATALOG_URL).then((response) => response.ok ? response.json() : null).catch(() => null),
+    ]).then(([maplibregl, { PMTiles, Protocol }, catalog]) => {
       if (disposed || !mapContainerRef.current) return;
+      const release = typeof catalog?.latest === "string" ? catalog.latest : OVERTURE_FALLBACK_RELEASE;
+      const tilesUrl = `https://overturemaps-extras-us-west-2.s3.us-west-2.amazonaws.com/tiles/${release}/buildings.pmtiles`;
+      setOvertureRelease(release);
+      setDatasetName(`Overture Maps · ${release}`);
+      const protocol = new Protocol();
+      maplibregl.addProtocol("pmtiles", protocol.tile);
+      protocol.add(new PMTiles(tilesUrl));
+      removePmtilesProtocol = () => maplibregl.removeProtocol("pmtiles");
       const map = new maplibregl.Map({
         container: mapContainerRef.current,
         style: "https://tiles.openfreemap.org/styles/positron",
@@ -390,11 +387,16 @@ export function AirspacePlanner() {
         zoom: 14.2,
         pitch: 0,
         bearing: 0,
-        attributionControl: true,
+        attributionControl: {},
       });
       mapRef.current = map;
       map.on("load", () => {
         const beforeId = map.getStyle().layers?.find((layer) => layer.type === "symbol")?.id;
+        map.addSource("overture-buildings", {
+          type: "vector",
+          url: `pmtiles://${tilesUrl}`,
+          attribution: '<a href="https://docs.overturemaps.org/attribution" target="_blank">© Overture Maps Foundation</a>',
+        });
         map.addSource("clearance-zones", { type: "geojson", data: emptyFeatures() });
         map.addSource("clearance-conflicts", { type: "geojson", data: emptyFeatures() });
         map.addSource("clearance-buildings", { type: "geojson", data: emptyFeatures() });
@@ -403,24 +405,51 @@ export function AirspacePlanner() {
         map.addLayer({ id: "clearance-zone-line", type: "line", source: "clearance-zones", paint: { "line-color": "#8f6b28", "line-width": 1.25, "line-dasharray": [3, 2] } }, beforeId);
         map.addLayer({ id: "clearance-conflict-fill", type: "fill", source: "clearance-conflicts", paint: { "fill-color": "#df3d33", "fill-opacity": 0.25 } }, beforeId);
         map.addLayer({ id: "clearance-conflict-line", type: "line", source: "clearance-conflicts", paint: { "line-color": "#bd3028", "line-width": 1 } }, beforeId);
+        map.addLayer({ id: "overture-building-fill", type: "fill", source: "overture-buildings", "source-layer": "building", minzoom: 12.5, paint: { "fill-color": ["step", ["coalesce", ["get", "height"], 9], "#89908e", 107, "#4e585c", 244, "#182229"], "fill-opacity": 0.84 } }, beforeId);
+        map.addLayer({ id: "overture-building-part-fill", type: "fill", source: "overture-buildings", "source-layer": "building_part", minzoom: 12.5, paint: { "fill-color": ["step", ["coalesce", ["get", "height"], 9], "#7f8886", 107, "#465156", 244, "#111b21"], "fill-opacity": 0.9 } }, beforeId);
+        map.addLayer({ id: "overture-building-line", type: "line", source: "overture-buildings", "source-layer": "building", minzoom: 12.5, paint: { "line-color": "#ffffff", "line-width": 0.65, "line-opacity": 0.72 } }, beforeId);
         map.addLayer({ id: "clearance-building-fill", type: "fill", source: "clearance-buildings", paint: { "fill-color": ["step", ["get", "heightFt"], "#89908e", 350, "#4e585c", 800, "#182229"], "fill-opacity": 0.9 } }, beforeId);
         map.addLayer({ id: "clearance-building-line", type: "line", source: "clearance-buildings", paint: { "line-color": "#ffffff", "line-width": 0.65, "line-opacity": 0.72 } }, beforeId);
         map.addLayer({ id: "clearance-selected-outer", type: "circle", source: "clearance-selected", paint: { "circle-radius": 10, "circle-color": "#fffdf7", "circle-stroke-width": 4, "circle-stroke-color": ["match", ["get", "state"], "conflict", "#d82f29", "clear", "#176b59", "#182229"] } });
         map.addLayer({ id: "clearance-selected-inner", type: "circle", source: "clearance-selected", paint: { "circle-radius": 3, "circle-color": ["match", ["get", "state"], "conflict", "#d82f29", "clear", "#176b59", "#182229"] } });
         setMapReady(true);
       });
+      const syncVisibleBuildings = () => {
+        if (liveDataRef.current.sourceMode !== "overture" || !map.getSource("overture-buildings")) return;
+        const center = map.getCenter();
+        const nextOrigin = { lat: center.lat, lon: center.lng };
+        if (map.getZoom() < 12.5) {
+          setOrigin(nextOrigin);
+          setBuildings([]);
+          setZones([viewportStudyZone(map, nextOrigin)]);
+          setDataNote("Zoom to neighborhood level to load building envelopes");
+          return;
+        }
+        const visible = visibleOvertureBuildings(map, nextOrigin);
+        if (!visible.length) return;
+        const measured = visible.filter((building) => building.heightSource !== "30 ft fallback").length;
+        setOrigin(nextOrigin);
+        setBuildings(visible);
+        setZones([viewportStudyZone(map, nextOrigin)]);
+        setDatasetName(`Overture Maps · ${release}`);
+        setDataNote(`${visible.length.toLocaleString()} visible envelopes · ${measured.toLocaleString()} with height/floor data`);
+      };
+      map.on("idle", syncVisibleBuildings);
+      map.on("moveend", syncVisibleBuildings);
       map.on("click", (event) => {
-        const current = liveDataRef.current;
-        setSelected(lngLatToLocal(event.lngLat.lng, event.lngLat.lat, current.origin));
+        setSelectedLngLat([event.lngLat.lng, event.lngLat.lat]);
       });
       map.on("error", () => {
         if (!map.loaded()) setBasemapError(true);
       });
+    }).catch(() => {
+      if (!disposed) setBasemapError(true);
     });
     return () => {
       disposed = true;
       mapRef.current?.remove();
       mapRef.current = null;
+      removePmtilesProtocol?.();
     };
   }, []);
 
@@ -428,9 +457,11 @@ export function AirspacePlanner() {
     if (!mapReady || !mapRef.current) return;
     (mapRef.current.getSource("clearance-zones") as GeoJSONSource)?.setData(zonesGeoJson);
     (mapRef.current.getSource("clearance-conflicts") as GeoJSONSource)?.setData(conflictsGeoJson);
-    (mapRef.current.getSource("clearance-buildings") as GeoJSONSource)?.setData(buildingsGeoJson);
+    (mapRef.current.getSource("clearance-buildings") as GeoJSONSource)?.setData(sourceMode === "local" ? buildingsGeoJson : emptyFeatures());
     (mapRef.current.getSource("clearance-selected") as GeoJSONSource)?.setData(selectedGeoJson);
-  }, [mapReady, zonesGeoJson, conflictsGeoJson, buildingsGeoJson, selectedGeoJson]);
+    ["clearance-building-fill", "clearance-building-line"].forEach((id) => mapRef.current?.setLayoutProperty(id, "visibility", sourceMode === "local" ? "visible" : "none"));
+    ["overture-building-fill", "overture-building-part-fill", "overture-building-line"].forEach((id) => mapRef.current?.setLayoutProperty(id, "visibility", sourceMode === "overture" ? "visible" : "none"));
+  }, [mapReady, zonesGeoJson, conflictsGeoJson, buildingsGeoJson, selectedGeoJson, sourceMode]);
 
   async function handleImport(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
@@ -440,12 +471,13 @@ export function AirspacePlanner() {
       const text = await file.text();
       const imported = file.name.toLowerCase().endsWith(".csv") ? parseCsv(text) : parseGeoJson(text);
       if (!imported.buildings.length) throw new Error("No usable building records were found.");
+      setSourceMode("local");
       setBuildings(imported.buildings);
       setOrigin(imported.origin);
       setZones([makeConservativeZone(imported.buildings, "Imported conservative study area")]);
       setDatasetName(file.name);
       setDataNote(`${imported.buildings.length.toLocaleString()} buildings · ${imported.note}`);
-      setSelected({ x: 0, y: 0 });
+      setSelectedLngLat([imported.origin.lon, imported.origin.lat]);
       mapRef.current?.flyTo({ center: [imported.origin.lon, imported.origin.lat], zoom: 15, essential: true });
     } catch (error) {
       setImportError(error instanceof Error ? error.message : "This file could not be read.");
@@ -454,15 +486,18 @@ export function AirspacePlanner() {
     }
   }
 
-  function resetSample() {
-    setBuildings(SAMPLE_BUILDINGS);
-    setOrigin(CHICAGO_ORIGIN);
-    setZones(SAMPLE_ZONES);
-    setDatasetName("Downtown Chicago · sample");
-    setDataNote(`${SAMPLE_BUILDINGS.length} envelope records · 3 study polygons`);
-    setSelected({ x: 80, y: 160 });
+  function activateOverture() {
+    const center = mapRef.current?.getCenter();
+    const nextOrigin = center ? { lat: center.lat, lon: center.lng } : CHICAGO_ORIGIN;
+    setSourceMode("overture");
+    setBuildings([]);
+    setOrigin(nextOrigin);
+    setZones(mapRef.current ? [viewportStudyZone(mapRef.current, nextOrigin)] : []);
+    setDatasetName(`Overture Maps · ${overtureRelease}`);
+    setDataNote("Loading visible building tiles…");
+    setSelectedLngLat([nextOrigin.lon, nextOrigin.lat]);
     setImportError("");
-    mapRef.current?.flyTo({ center: [CHICAGO_ORIGIN.lon, CHICAGO_ORIGIN.lat], zoom: 14.2, essential: true });
+    mapRef.current?.triggerRepaint();
   }
 
   function downloadTemplate() {
@@ -483,11 +518,10 @@ export function AirspacePlanner() {
   return (
     <main className="app-shell">
       <header className="topbar">
-        <button className="brand" onClick={resetSample} aria-label="Clearance home and reset sample"><span className="brand-mark" aria-hidden="true"><i /></span><span>CLEARANCE</span></button>
+        <button className="brand" onClick={activateOverture} aria-label="Clearance home and use automatic Overture buildings"><span className="brand-mark" aria-hidden="true"><i /></span><span>CLEARANCE</span></button>
         <div className="rule-chip"><span>RULESET</span> FAA §91.119(b)</div>
         <div className="topbar-actions">
-          <button className="data-source" onClick={() => inputRef.current?.click()}><span className="status-dot" /><span><small>ACTIVE DATASET</small>{datasetName}</span></button>
-          <button className="import-button" onClick={() => inputRef.current?.click()}><span aria-hidden="true">↥</span> Import data</button>
+          <div className={`overture-status ${sourceMode === "local" ? "local" : ""}`}><span className="status-dot" /><span><small>BUILDING DATA</small>{sourceMode === "overture" ? "Overture Maps · Live PMTiles" : "Local override · Overture paused"}</span></div>
           <button className="icon-button" onClick={() => setInfoOpen(true)} aria-label="About this planning aid">?</button>
           <input ref={inputRef} className="visually-hidden" type="file" accept=".csv,.geojson,.json,application/geo+json,text/csv" onChange={handleImport} />
         </div>
@@ -519,9 +553,9 @@ export function AirspacePlanner() {
           <div className="screen-summary"><span><small>RED AREA</small><strong>{flaggedSquareMiles.toFixed(2)} mi²</strong></span><span><small>ACTIVE OBSTACLES</small><strong>{activeObstacles}</strong></span></div>
 
           <a className="national-source" href="https://docs.overturemaps.org/guides/buildings/" target="_blank" rel="noreferrer">
-            <span className="source-kicker">NATIONWIDE BUILDING SOURCE</span>
+            <span className="source-kicker">AUTOMATIC NATIONAL LAYER · LIVE</span>
             <strong>Overture Maps Buildings <b>↗</b></strong>
-            <span>Polygon/MultiPolygon footprints · height in meters · building parts</span>
+            <span>PMTiles {overtureRelease} · footprints, heights, and building parts</span>
           </a>
 
           <div className="panel-footer">
@@ -534,14 +568,14 @@ export function AirspacePlanner() {
           <div ref={mapContainerRef} className="map-container" aria-label={`Interactive basemap at ${altitudeFt} feet AGL. Red areas do not meet the modeled clearance. Click to check a point.`} />
           {!mapReady && !basemapError && <div className="basemap-loading"><i />Loading basemap…</div>}
           {basemapError && !mapReady && <div className="basemap-loading error">Basemap unavailable. Check your connection.</div>}
-          <div className="map-titlebar"><div><span className="location-pin" aria-hidden="true" /><strong>{datasetName}</strong><small>{origin.lat.toFixed(4)}° N, {Math.abs(origin.lon).toFixed(4)}° W</small></div><span className="map-mode">2D · AGL</span></div>
+          <div className="map-titlebar"><div><span className="location-pin" aria-hidden="true" /><strong>{sourceMode === "overture" ? "Overture building envelopes" : datasetName}</strong><small>{origin.lat.toFixed(4)}° N, {Math.abs(origin.lon).toFixed(4)}° W</small></div><span className="map-mode">2D · AGL</span></div>
           <div className="map-controls" aria-label="Map zoom controls">
             <button onClick={() => mapRef.current?.zoomIn()} aria-label="Zoom in">＋</button>
             <button onClick={() => mapRef.current?.zoomOut()} aria-label="Zoom out">−</button>
             <button onClick={() => mapRef.current?.flyTo({ center: [origin.lon, origin.lat], zoom: 14.2, essential: true })} aria-label="Reset map view">◎</button>
           </div>
           <div className="legend" aria-label="Map legend"><span><i className="legend-red" />Envelope conflict</span><span><i className="legend-amber" />Study polygon</span><span><i className="legend-building" />Building envelope</span></div>
-          <div className="dataset-card"><span className="dataset-icon" aria-hidden="true">▤</span><span><small>BUILDING ENVELOPES</small><strong>{datasetName}</strong><em>{dataNote}</em></span><button onClick={() => inputRef.current?.click()}>Replace</button></div>
+          <div className="dataset-card"><span className="dataset-icon" aria-hidden="true">▤</span><span><small>{sourceMode === "overture" ? "AUTOMATIC BUILDING LAYER" : "LOCAL OVERRIDE"}</small><strong>{datasetName}</strong><em>{dataNote}</em></span>{sourceMode === "local" ? <button onClick={activateOverture}>Use Overture</button> : <span className="data-live">LIVE</span>}</div>
           <div className="basemap-badge">BASEMAP · OPENFREEMAP / OPENSTREETMAP</div>
         </section>
       </section>
@@ -549,20 +583,21 @@ export function AirspacePlanner() {
       <footer className="legal-bar"><span><b>PLANNING AID ONLY</b> This screen does not determine whether a flight is legal or authorized.</span><button onClick={() => setInfoOpen(true)}>Read limitations</button></footer>
       {importError && <div className="toast error" role="alert"><span>!</span>{importError}<button onClick={() => setImportError("")} aria-label="Dismiss error">×</button></div>}
 
-      {infoOpen && <div className="modal-backdrop" role="presentation" onMouseDown={() => setInfoOpen(false)}>
-        <section className="info-modal" role="dialog" aria-modal="true" aria-labelledby="limitations-title" onMouseDown={(event) => event.stopPropagation()}>
+      {infoOpen && <div className="modal-backdrop">
+        <button className="modal-scrim" onClick={() => setInfoOpen(false)} aria-label="Close limitations dialog" />
+        <section className="info-modal" role="dialog" aria-modal="true" aria-labelledby="limitations-title">
           <button className="modal-close" onClick={() => setInfoOpen(false)} aria-label="Close">×</button>
           <span className="modal-kicker">MODEL NOTES</span>
           <h2 id="limitations-title">Full envelopes, with important limits.</h2>
           <p>GeoJSON Polygon and MultiPolygon outer footprints are preserved. The red geometry begins at the closest footprint edge, buffers it by 2,000 feet, and compares the selected altitude with the building height plus 1,000 feet.</p>
-          <p>The FAA evaluates whether an area is “congested” case by case. Imported buildings are therefore placed in a conservative study polygon—not labeled as an official FAA boundary.</p>
+          <p>The FAA evaluates whether an area is “congested” case by case. The visible map extent is treated as a conservative study area—not labeled as an official FAA boundary.</p>
           <div className="modal-warning"><b>Small UAS note</b><span>Part 107 generally uses a different 400-foot AGL framework and may require airspace authorization. This prototype models the Part 91 rule named above.</span></div>
           <div className="source-detail">
-            <h3>Recommended national source: Overture Maps</h3>
-            <p>Overture Buildings provides nationwide Polygon/MultiPolygon footprints, building parts, and height in meters when available. Download a bounding-box extract and import GeoJSON here. A national deployment should convert the cloud-hosted GeoParquet into regional vector tiles rather than sending the full dataset to a browser.</p>
+            <h3>Automatic national source: Overture Maps</h3>
+            <p>The map loads Overture’s official global Buildings PMTiles archive for the current release. Visible Polygon/MultiPolygon footprints, building parts, and available height fields feed the clearance model automatically at neighborhood zoom.</p>
             <a href="https://docs.overturemaps.org/guides/buildings/" target="_blank" rel="noreferrer">Open Overture Buildings guide ↗</a>
           </div>
-          <div className="file-help"><h3>Bring your own height data</h3><p>GeoJSON: use <code>height_ft</code>, Overture <code>height</code> (meters), <code>height_m</code>, <code>num_floors</code>, or <code>building:levels</code>. CSV: include <code>lat, lon, height_ft, width_ft, depth_ft</code>.</p><button onClick={downloadTemplate}>Download CSV template</button></div>
+          <div className="file-help"><h3>Advanced local override</h3><p>GeoJSON: use <code>height_ft</code>, Overture <code>height</code> (meters), <code>height_m</code>, <code>num_floors</code>, or <code>building:levels</code>. CSV: include <code>lat, lon, height_ft, width_ft, depth_ft</code>.</p><div className="file-actions"><button onClick={() => inputRef.current?.click()}>Import local file</button><button onClick={downloadTemplate}>Download CSV template</button>{sourceMode === "local" && <button onClick={activateOverture}>Return to Overture</button>}</div></div>
           <div className="modal-links"><a href="https://www.faa.gov/about/office_org/headquarters_offices/agc/practice_areas/regulations/interpretations/Data/interps/2009/Anderson_2009_Legal_Interpretation.pdf" target="_blank" rel="noreferrer">FAA Anderson interpretation ↗</a><a href="https://openfreemap.org/quick_start/" target="_blank" rel="noreferrer">Basemap source ↗</a></div>
         </section>
       </div>}
