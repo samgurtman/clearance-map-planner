@@ -12,6 +12,7 @@ import {
   useState,
 } from "react";
 import type { GeoJSONSource, Map as MapLibreMap } from "maplibre-gl";
+import maplibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
 
 type Point = { x: number; y: number };
 type Origin = { lat: number; lon: number };
@@ -419,6 +420,7 @@ export function AirspacePlanner() {
       fetch(OVERTURE_CATALOG_URL).then((response) => response.ok ? response.json() : null).catch(() => null),
     ]).then(([maplibregl, { PMTiles }, { VectorTile }, { PbfReader }, catalog]) => {
       if (disposed || !mapContainerRef.current) return;
+      maplibregl.setWorkerUrl(maplibreWorkerUrl);
       const release = typeof catalog?.latest === "string" ? catalog.latest : OVERTURE_FALLBACK_RELEASE;
       const tilesUrl = `https://overturemaps-extras-us-west-2.s3.us-west-2.amazonaws.com/tiles/${release}/buildings.pmtiles`;
       setOvertureRelease(release);
