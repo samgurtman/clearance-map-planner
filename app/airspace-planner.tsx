@@ -25,7 +25,7 @@ type Building = Point & {
 };
 type Zone = { id: string; label: string; points: Point[]; source: string };
 type Check = {
-  state: "conflict" | "clear" | "outside";
+  state: "conflict" | "clear" | "outside" | "unavailable";
   zone?: Zone;
   obstacle?: Building;
   requiredFt?: number;
@@ -33,6 +33,7 @@ type Check = {
   envelopeDistanceFt?: number;
 };
 type ImportedDataset = { buildings: Building[]; origin: Origin; note: string };
+type CoverageStatus = "loading" | "ready" | "zoom-required" | "error";
 
 const CHICAGO_ORIGIN: Origin = { lat: 41.8819, lon: -87.6324 };
 const OVERTURE_FALLBACK_RELEASE = "2026-07-22.0";
@@ -366,6 +367,7 @@ export function AirspacePlanner() {
   const [origin, setOrigin] = useState<Origin>(CHICAGO_ORIGIN);
   const [datasetName, setDatasetName] = useState("Overture Maps · automatic");
   const [dataNote, setDataNote] = useState("Loading visible building tiles…");
+  const [coverageStatus, setCoverageStatus] = useState<CoverageStatus>("loading");
   const [sourceMode, setSourceMode] = useState<"overture" | "local">("overture");
   const [overtureRelease, setOvertureRelease] = useState(OVERTURE_FALLBACK_RELEASE);
   const [selectedLngLat, setSelectedLngLat] = useState<[number, number]>(localToLngLat({ x: 80, y: 160 }, CHICAGO_ORIGIN));
@@ -380,7 +382,11 @@ export function AirspacePlanner() {
   }, [altitudeFt, buildings, zones, origin, sourceMode]);
 
   const selected = useMemo(() => lngLatToLocal(selectedLngLat[0], selectedLngLat[1], origin), [selectedLngLat, origin]);
-  const check = useMemo(() => evaluatePoint(selected, altitudeFt, buildings, zones), [selected, altitudeFt, buildings, zones]);
+  const modelAvailable = sourceMode === "local" || coverageStatus === "ready";
+  const check = useMemo<Check>(
+    () => modelAvailable ? evaluatePoint(selected, altitudeFt, buildings, zones) : { state: "unavailable" },
+    [modelAvailable, selected, altitudeFt, buildings, zones],
+  );
   const activeObstacles = useMemo(() => buildings.filter((building) => altitudeFt < building.heightFt + 1000).length, [altitudeFt, buildings]);
   const flaggedSquareMiles = useMemo(() => estimateFlaggedSquareMiles(altitudeFt, buildings, zones), [altitudeFt, buildings, zones]);
   const buildingsGeoJson = useMemo(
@@ -454,11 +460,13 @@ export function AirspacePlanner() {
         const center = map.getCenter();
         const nextOrigin = { lat: center.lat, lon: center.lng };
         const source = map.getSource("overture-buildings") as GeoJSONSource;
+        setCoverageStatus("loading");
+        source.setData(emptyFeatures());
+        setOrigin(nextOrigin);
+        setBuildings([]);
+        setZones([viewportStudyZone(map, nextOrigin)]);
         if (map.getZoom() < 12.5) {
-          source.setData(emptyFeatures());
-          setOrigin(nextOrigin);
-          setBuildings([]);
-          setZones([viewportStudyZone(map, nextOrigin)]);
+          setCoverageStatus("zoom-required");
           setDataNote("Zoom to neighborhood level to load building envelopes");
           return;
         }
@@ -474,8 +482,7 @@ export function AirspacePlanner() {
           for (let y = minY; y <= maxY; y += 1) coordinates.push({ x, y });
         }
         if (!coordinates.length || coordinates.length > 8) {
-          source.setData(emptyFeatures());
-          setBuildings([]);
+          setCoverageStatus("zoom-required");
           setDataNote("Zoom in to load a smaller set of building tiles");
           return;
         }
@@ -524,11 +531,15 @@ export function AirspacePlanner() {
           setOrigin(nextOrigin);
           setBuildings(nextBuildings);
           setZones([viewportStudyZone(map, nextOrigin)]);
+          setCoverageStatus("ready");
           setDatasetName(`Overture Maps · ${release}`);
           setDataNote(`${nextBuildings.length.toLocaleString()} visible envelopes · ${measured.toLocaleString()} with height/floor data`);
         } catch (error) {
           console.error("Overture building tile load failed", error);
-          if (!disposed && requestId === loadSerial) setDataNote("Overture building tiles could not be reached. Reload to try again.");
+          if (!disposed && requestId === loadSerial) {
+            setCoverageStatus("error");
+            setDataNote("Overture building tiles could not be reached. Reload to try again.");
+          }
         }
       };
       overtureReloadRef.current = () => { void loadVisibleBuildingTiles(); };
@@ -536,6 +547,7 @@ export function AirspacePlanner() {
       map.on("style.load", () => {
         setMapReady(true);
         setBasemapError(false);
+        setCoverageStatus("loading");
         setDataNote("Connecting to Overture building archive…");
         requestAnimationFrame(async () => {
           try {
@@ -555,11 +567,12 @@ export function AirspacePlanner() {
             map.addLayer({ id: "overture-building-line", type: "line", source: "overture-buildings", minzoom: 12.5, filter: ["==", ["get", "__sourceLayer"], "building"], paint: { "line-color": "#ffffff", "line-width": 0.65, "line-opacity": 0.72 } }, beforeId);
             map.addLayer({ id: "clearance-building-fill", type: "fill", source: "clearance-buildings", paint: { "fill-color": ["step", ["get", "heightFt"], "#89908e", 350, "#4e585c", 800, "#182229"], "fill-opacity": 0.9 } }, beforeId);
             map.addLayer({ id: "clearance-building-line", type: "line", source: "clearance-buildings", paint: { "line-color": "#ffffff", "line-width": 0.65, "line-opacity": 0.72 } }, beforeId);
-            map.addLayer({ id: "clearance-selected-outer", type: "circle", source: "clearance-selected", paint: { "circle-radius": 10, "circle-color": "#fffdf7", "circle-stroke-width": 4, "circle-stroke-color": ["match", ["get", "state"], "conflict", "#d82f29", "clear", "#176b59", "#182229"] } });
-            map.addLayer({ id: "clearance-selected-inner", type: "circle", source: "clearance-selected", paint: { "circle-radius": 3, "circle-color": ["match", ["get", "state"], "conflict", "#d82f29", "clear", "#176b59", "#182229"] } });
+            map.addLayer({ id: "clearance-selected-outer", type: "circle", source: "clearance-selected", paint: { "circle-radius": 10, "circle-color": "#fffdf7", "circle-stroke-width": 4, "circle-stroke-color": ["match", ["get", "state"], "conflict", "#d82f29", "clear", "#176b59", "unavailable", "#c08a2c", "#182229"] } });
+            map.addLayer({ id: "clearance-selected-inner", type: "circle", source: "clearance-selected", paint: { "circle-radius": 3, "circle-color": ["match", ["get", "state"], "conflict", "#d82f29", "clear", "#176b59", "unavailable", "#c08a2c", "#182229"] } });
             void loadVisibleBuildingTiles();
           } catch (error) {
             console.error("Clearance map layer setup failed", error);
+            setCoverageStatus("error");
             setDataNote("Overture building archive could not be reached. Reload to try again.");
           }
         });
@@ -612,6 +625,7 @@ export function AirspacePlanner() {
       const imported = file.name.toLowerCase().endsWith(".csv") ? parseCsv(text) : parseGeoJson(text);
       if (!imported.buildings.length) throw new Error("No usable building records were found.");
       setSourceMode("local");
+      setCoverageStatus("ready");
       setBuildings(imported.buildings);
       setOrigin(imported.origin);
       setZones([makeConservativeZone(imported.buildings, "Imported conservative study area")]);
@@ -630,6 +644,7 @@ export function AirspacePlanner() {
     const center = mapRef.current?.getCenter();
     const nextOrigin = center ? { lat: center.lat, lon: center.lng } : CHICAGO_ORIGIN;
     setSourceMode("overture");
+    setCoverageStatus("loading");
     setBuildings([]);
     setOrigin(nextOrigin);
     setZones(mapRef.current ? [viewportStudyZone(mapRef.current, nextOrigin)] : []);
@@ -653,7 +668,21 @@ export function AirspacePlanner() {
     URL.revokeObjectURL(link.href);
   }
 
-  const statusTitle = check.state === "conflict" ? "Modeled clearance not met" : check.state === "clear" ? "Modeled clearance met" : "Outside study polygons";
+  const statusTitle = check.state === "conflict"
+    ? "Modeled clearance not met"
+    : check.state === "clear"
+      ? "Modeled clearance met"
+      : check.state === "unavailable"
+        ? "Clearance not evaluated"
+        : "Outside study polygons";
+  const overtureCoverageLabel = coverageStatus === "loading"
+    ? "Overture Maps · Loading coverage"
+    : coverageStatus === "error"
+      ? "Overture Maps · Coverage unavailable"
+      : coverageStatus === "ready"
+        ? "Overture Maps · Coverage loaded"
+        : "Overture Maps · Zoom in required";
+  const coverageBadge = coverageStatus === "loading" ? "LOADING" : coverageStatus === "error" ? "ERROR" : "ZOOM IN";
 
   return (
     <main className="app-shell">
@@ -661,7 +690,7 @@ export function AirspacePlanner() {
         <button className="brand" onClick={activateOverture} aria-label="Clearance home and use automatic Overture buildings"><span className="brand-mark" aria-hidden="true"><i /></span><span>CLEARANCE</span></button>
         <div className="rule-chip"><span>RULESET</span> FAA §91.119(b)</div>
         <div className="topbar-actions">
-          <div className={`overture-status ${sourceMode === "local" ? "local" : ""}`}><span className="status-dot" /><span><small>BUILDING DATA</small>{sourceMode === "overture" ? "Overture Maps · Live PMTiles" : "Local override · Overture paused"}</span></div>
+          <div className={`overture-status ${sourceMode === "local" ? "local" : modelAvailable ? "" : "paused"}`}><span className="status-dot" /><span><small>BUILDING DATA</small>{sourceMode === "overture" ? overtureCoverageLabel : "Local override · Overture paused"}</span></div>
           <button className="icon-button" onClick={() => setInfoOpen(true)} aria-label="About this planning aid">?</button>
           <input ref={inputRef} className="visually-hidden" type="file" accept=".csv,.geojson,.json,application/geo+json,text/csv" onChange={handleImport} />
         </div>
@@ -669,7 +698,7 @@ export function AirspacePlanner() {
 
       <section className="workspace">
         <aside className="control-panel">
-          <div className="eyebrow-row"><span className="eyebrow">FLIGHT ALTITUDE</span><span className="live-label"><i /> ENVELOPE MODEL</span></div>
+          <div className="eyebrow-row"><span className="eyebrow">FLIGHT ALTITUDE</span><span className={`live-label ${modelAvailable ? "" : "paused"}`}><i /> ENVELOPE MODEL</span></div>
           <div className="altitude-readout"><strong>{altitudeFt.toLocaleString()}</strong><span>FT<br />AGL</span></div>
           <label className="slider-wrap"><span className="visually-hidden">Flight altitude in feet above ground level</span><input type="range" min="500" max="3000" step="50" value={altitudeFt} onChange={(event) => setAltitudeFt(Number(event.target.value))} /><span className="range-labels"><b>500</b><b>3,000 FT</b></span></label>
           <div className="preset-row" aria-label="Altitude presets">{[1000, 1500, 2000, 2500].map((preset) => <button key={preset} className={altitudeFt === preset ? "active" : ""} onClick={() => setAltitudeFt(preset)}>{preset.toLocaleString()}</button>)}</div>
@@ -681,8 +710,8 @@ export function AirspacePlanner() {
           </div>
 
           <div className={`point-check ${check.state}`} aria-live="polite">
-            <div className="point-check-title"><span className="check-symbol">{check.state === "conflict" ? "!" : check.state === "clear" ? "✓" : "·"}</span><span><small>SELECTED POINT</small>{statusTitle}</span></div>
-            {check.state !== "outside" ? <dl>
+            <div className="point-check-title"><span className="check-symbol">{check.state === "conflict" ? "!" : check.state === "clear" ? "✓" : check.state === "unavailable" ? "?" : "·"}</span><span><small>SELECTED POINT</small>{statusTitle}</span></div>
+            {check.state === "unavailable" ? <p>Zoom in until Overture building coverage loads. No clearance result is shown without evaluated building data.</p> : check.state !== "outside" ? <dl>
               <div><dt>Required altitude</dt><dd>{check.requiredFt?.toLocaleString()} ft</dd></div>
               <div><dt>{(check.marginFt ?? 0) < 0 ? "Shortfall" : "Margin"}</dt><dd>{Math.abs(check.marginFt ?? 0).toLocaleString()} ft</dd></div>
               <div><dt>Highest within 2,000 ft</dt><dd>{check.obstacle?.name ?? "Ground baseline"}</dd></div>
@@ -690,7 +719,7 @@ export function AirspacePlanner() {
             </dl> : <p>Click inside a dashed amber study polygon to run the clearance screen.</p>}
           </div>
 
-          <div className="screen-summary"><span><small>RED AREA</small><strong>{flaggedSquareMiles.toFixed(2)} mi²</strong></span><span><small>ACTIVE OBSTACLES</small><strong>{activeObstacles}</strong></span></div>
+          <div className="screen-summary"><span><small>RED AREA</small><strong>{modelAvailable ? `${flaggedSquareMiles.toFixed(2)} mi²` : "—"}</strong></span><span><small>ACTIVE OBSTACLES</small><strong>{modelAvailable ? activeObstacles : "—"}</strong></span></div>
 
           <a className="national-source" href="https://docs.overturemaps.org/guides/buildings/" target="_blank" rel="noreferrer">
             <span className="source-kicker">AUTOMATIC NATIONAL LAYER · LIVE</span>
@@ -715,7 +744,7 @@ export function AirspacePlanner() {
             <button onClick={() => mapRef.current?.flyTo({ center: [origin.lon, origin.lat], zoom: 14.2, essential: true })} aria-label="Reset map view">◎</button>
           </div>
           <div className="legend" aria-label="Map legend"><span><i className="legend-red" />Envelope conflict</span><span><i className="legend-amber" />Study polygon</span><span><i className="legend-building" />Building envelope</span></div>
-          <div className="dataset-card"><span className="dataset-icon" aria-hidden="true">▤</span><span><small>{sourceMode === "overture" ? "AUTOMATIC BUILDING LAYER" : "LOCAL OVERRIDE"}</small><strong>{datasetName}</strong><em>{dataNote}</em></span>{sourceMode === "local" ? <button onClick={activateOverture}>Use Overture</button> : <span className="data-live">LIVE</span>}</div>
+          <div className="dataset-card"><span className="dataset-icon" aria-hidden="true">▤</span><span><small>{sourceMode === "overture" ? "AUTOMATIC BUILDING LAYER" : "LOCAL OVERRIDE"}</small><strong>{datasetName}</strong><em>{dataNote}</em></span>{sourceMode === "local" ? <button onClick={activateOverture}>Use Overture</button> : <span className={`data-live ${modelAvailable ? "" : "paused"}`}>{modelAvailable ? "LIVE" : coverageBadge}</span>}</div>
           <div className="basemap-badge">BASEMAP · CARTO / OPENSTREETMAP</div>
         </section>
       </section>
