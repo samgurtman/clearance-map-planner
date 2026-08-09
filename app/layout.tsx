@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { headers } from "next/headers";
+import "maplibre-gl/dist/maplibre-gl.css";
 import "./globals.css";
 
 export async function generateMetadata(): Promise<Metadata> {

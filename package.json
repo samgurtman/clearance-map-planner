@@ -14,7 +14,11 @@
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
+    "@turf/buffer": "^7.4.0",
+    "@turf/helpers": "^7.4.0",
+    "@turf/intersect": "^7.4.0",
     "drizzle-orm": "0.45.2",
+    "maplibre-gl": "^6.2.0",
     "react": "19.2.6",
     "react-dom": "19.2.6"
   },
