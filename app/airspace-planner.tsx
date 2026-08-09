@@ -38,8 +38,190 @@ type CoverageStatus = "loading" | "ready" | "zoom-required" | "error";
 const CHICAGO_ORIGIN: Origin = { lat: 41.8819, lon: -87.6324 };
 const OVERTURE_FALLBACK_RELEASE = "2026-07-22.0";
 const OVERTURE_CATALOG_URL = "https://stac.overturemaps.org/catalog.json";
+const OVERTURE_TILE_CACHE_DB = "clearance-overture-tile-cache-v1";
+const OVERTURE_TILE_CACHE_STORE = "tiles";
+const OVERTURE_TILE_CACHE_META_STORE = "metadata";
+const OVERTURE_MEMORY_CACHE_MAX_TILES = 24;
+const OVERTURE_MEMORY_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+const OVERTURE_PERSISTENT_CACHE_MAX_TILES = 64;
+const OVERTURE_PERSISTENT_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 const FEET_PER_LAT_DEGREE = 364_000;
 const feetPerLonDegree = (latitude: number) => 364_000 * Math.cos((latitude * Math.PI) / 180);
+
+type OvertureTileCacheMetadata = { key: string; byteLength: number; lastUsed: number };
+
+const overtureMemoryTileCache = new Map<string, ArrayBuffer>();
+const overtureTileRequests = new Map<string, Promise<ArrayBuffer | null>>();
+let overtureMemoryTileCacheBytes = 0;
+let overtureTileCacheDatabase: Promise<IDBDatabase | null> | null = null;
+
+function readMemoryTile(key: string) {
+  const data = overtureMemoryTileCache.get(key);
+  if (!data) return null;
+  overtureMemoryTileCache.delete(key);
+  overtureMemoryTileCache.set(key, data);
+  return data;
+}
+
+function rememberMemoryTile(key: string, data: ArrayBuffer) {
+  const previous = overtureMemoryTileCache.get(key);
+  if (previous) {
+    overtureMemoryTileCacheBytes -= previous.byteLength;
+    overtureMemoryTileCache.delete(key);
+  }
+  if (data.byteLength > OVERTURE_MEMORY_CACHE_MAX_BYTES) return;
+  overtureMemoryTileCache.set(key, data);
+  overtureMemoryTileCacheBytes += data.byteLength;
+  while (
+    overtureMemoryTileCache.size > OVERTURE_MEMORY_CACHE_MAX_TILES
+    || overtureMemoryTileCacheBytes > OVERTURE_MEMORY_CACHE_MAX_BYTES
+  ) {
+    const oldestKey = overtureMemoryTileCache.keys().next().value as string | undefined;
+    if (!oldestKey) break;
+    const oldest = overtureMemoryTileCache.get(oldestKey);
+    if (oldest) overtureMemoryTileCacheBytes -= oldest.byteLength;
+    overtureMemoryTileCache.delete(oldestKey);
+  }
+}
+
+function openOvertureTileCache() {
+  if (overtureTileCacheDatabase) return overtureTileCacheDatabase;
+  if (typeof indexedDB === "undefined") return Promise.resolve(null);
+  overtureTileCacheDatabase = new Promise((resolve) => {
+    const request = indexedDB.open(OVERTURE_TILE_CACHE_DB, 1);
+    request.onupgradeneeded = () => {
+      const database = request.result;
+      if (!database.objectStoreNames.contains(OVERTURE_TILE_CACHE_STORE)) {
+        database.createObjectStore(OVERTURE_TILE_CACHE_STORE);
+      }
+      if (!database.objectStoreNames.contains(OVERTURE_TILE_CACHE_META_STORE)) {
+        const metadata = database.createObjectStore(OVERTURE_TILE_CACHE_META_STORE, { keyPath: "key" });
+        metadata.createIndex("lastUsed", "lastUsed");
+      }
+    };
+    request.onsuccess = () => {
+      request.result.onversionchange = () => request.result.close();
+      resolve(request.result);
+    };
+    request.onerror = () => resolve(null);
+    request.onblocked = () => resolve(null);
+  });
+  return overtureTileCacheDatabase;
+}
+
+async function readPersistentTile(key: string) {
+  const database = await openOvertureTileCache();
+  if (!database) return null;
+  return new Promise<ArrayBuffer | null>((resolve) => {
+    try {
+      const transaction = database.transaction(OVERTURE_TILE_CACHE_STORE, "readonly");
+      const request = transaction.objectStore(OVERTURE_TILE_CACHE_STORE).get(key);
+      request.onsuccess = () => {
+        const data = request.result;
+        if (!(data instanceof ArrayBuffer)) {
+          resolve(null);
+          return;
+        }
+        resolve(data);
+        try {
+          const touch = database.transaction(OVERTURE_TILE_CACHE_META_STORE, "readwrite");
+          touch.objectStore(OVERTURE_TILE_CACHE_META_STORE).put({ key, byteLength: data.byteLength, lastUsed: Date.now() });
+        } catch {
+          // The tile remains usable even when cache metadata cannot be updated.
+        }
+      };
+      request.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+async function prunePersistentTileCache(database: IDBDatabase) {
+  const metadata = await new Promise<OvertureTileCacheMetadata[]>((resolve) => {
+    try {
+      const transaction = database.transaction(OVERTURE_TILE_CACHE_META_STORE, "readonly");
+      const request = transaction.objectStore(OVERTURE_TILE_CACHE_META_STORE).getAll();
+      request.onsuccess = () => resolve(request.result as OvertureTileCacheMetadata[]);
+      request.onerror = () => resolve([]);
+    } catch {
+      resolve([]);
+    }
+  });
+  let totalBytes = metadata.reduce((sum, item) => sum + item.byteLength, 0);
+  const oldestFirst = [...metadata].sort((a, b) => a.lastUsed - b.lastUsed);
+  const evicted: string[] = [];
+  while (
+    oldestFirst.length > OVERTURE_PERSISTENT_CACHE_MAX_TILES
+    || totalBytes > OVERTURE_PERSISTENT_CACHE_MAX_BYTES
+  ) {
+    const oldest = oldestFirst.shift();
+    if (!oldest) break;
+    totalBytes -= oldest.byteLength;
+    evicted.push(oldest.key);
+  }
+  if (!evicted.length) return;
+  await new Promise<void>((resolve) => {
+    try {
+      const transaction = database.transaction([OVERTURE_TILE_CACHE_STORE, OVERTURE_TILE_CACHE_META_STORE], "readwrite");
+      const tiles = transaction.objectStore(OVERTURE_TILE_CACHE_STORE);
+      const tileMetadata = transaction.objectStore(OVERTURE_TILE_CACHE_META_STORE);
+      evicted.forEach((key) => {
+        tiles.delete(key);
+        tileMetadata.delete(key);
+      });
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => resolve();
+      transaction.onabort = () => resolve();
+    } catch {
+      resolve();
+    }
+  });
+}
+
+async function writePersistentTile(key: string, data: ArrayBuffer) {
+  if (data.byteLength > OVERTURE_PERSISTENT_CACHE_MAX_BYTES) return;
+  const database = await openOvertureTileCache();
+  if (!database) return;
+  const stored = await new Promise<boolean>((resolve) => {
+    try {
+      const transaction = database.transaction([OVERTURE_TILE_CACHE_STORE, OVERTURE_TILE_CACHE_META_STORE], "readwrite");
+      transaction.objectStore(OVERTURE_TILE_CACHE_STORE).put(data, key);
+      transaction.objectStore(OVERTURE_TILE_CACHE_META_STORE).put({ key, byteLength: data.byteLength, lastUsed: Date.now() });
+      transaction.oncomplete = () => resolve(true);
+      transaction.onerror = () => resolve(false);
+      transaction.onabort = () => resolve(false);
+    } catch {
+      resolve(false);
+    }
+  });
+  if (stored) await prunePersistentTileCache(database);
+}
+
+async function loadCachedOvertureTile(key: string, load: () => Promise<ArrayBuffer | null>) {
+  const memoryTile = readMemoryTile(key);
+  if (memoryTile) return memoryTile;
+  const activeRequest = overtureTileRequests.get(key);
+  if (activeRequest) return activeRequest;
+  const request = (async () => {
+    const persistentTile = await readPersistentTile(key);
+    if (persistentTile) {
+      rememberMemoryTile(key, persistentTile);
+      return persistentTile;
+    }
+    const downloadedTile = await load();
+    if (!downloadedTile) return null;
+    rememberMemoryTile(key, downloadedTile);
+    void writePersistentTile(key, downloadedTile);
+    return downloadedTile;
+  })();
+  overtureTileRequests.set(key, request);
+  try {
+    return await request;
+  } finally {
+    if (overtureTileRequests.get(key) === request) overtureTileRequests.delete(key);
+  }
+}
 
 function rectangleEnvelope(x: number, y: number, width: number, depth: number): Point[] {
   return [
@@ -531,12 +713,19 @@ export function AirspacePlanner() {
         setCoverageStatus(viewportAlreadyCovered ? "ready" : "loading");
         setDataNote(`Loading ${coordinates.length} visible Overture tile${coordinates.length === 1 ? "" : "s"}…`);
         try {
-          const tiles = await Promise.all(coordinates.map(async ({ x, y }) => ({ x, y, tile: await archive.getZxy(zoom, x, y) })));
+          const tiles = await Promise.all(coordinates.map(async ({ x, y }) => ({
+            x,
+            y,
+            tile: await loadCachedOvertureTile(
+              `${release}:${zoom}/${x}/${y}`,
+              async () => (await archive.getZxy(zoom, x, y))?.data || null,
+            ),
+          })));
           if (disposed || requestId !== loadSerial) return;
           const decoded: Array<Feature<Polygon | MultiPolygon>> = [];
           for (const { x, y, tile } of tiles) {
             if (!tile) continue;
-            const vectorTile = new VectorTile(new PbfReader(new Uint8Array(tile.data)));
+            const vectorTile = new VectorTile(new PbfReader(new Uint8Array(tile)));
             (["building", "building_part"] as const).forEach((sourceLayer) => {
               const layer = vectorTile.layers[sourceLayer];
               if (!layer) return;
