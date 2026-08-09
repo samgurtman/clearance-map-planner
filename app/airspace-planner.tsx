@@ -94,11 +94,11 @@ function distanceToBuilding(value: Point, building: Building) {
 function evaluatePoint(value: Point, altitudeFt: number, buildings: Building[], zones: Zone[]): Check {
   const zone = zones.find((candidate) => pointInPolygon(value, candidate.points));
   if (!zone) return { state: "outside" };
-  const nearby = buildings
-    .map((building) => ({ building, distance: distanceToBuilding(value, building) }))
-    .filter((entry) => entry.distance <= 2000)
-    .sort((a, b) => b.building.heightFt - a.building.heightFt);
-  const highest = nearby[0];
+  let highest: { building: Building; distance: number } | undefined;
+  for (const building of buildings) {
+    const distance = distanceToBuilding(value, building);
+    if (distance <= 2000 && (!highest || building.heightFt > highest.building.heightFt)) highest = { building, distance };
+  }
   const requiredFt = Math.max(1000, (highest?.building.heightFt ?? 0) + 1000);
   const marginFt = altitudeFt - requiredFt;
   return {
@@ -243,11 +243,17 @@ function estimateFlaggedSquareMiles(altitudeFt: number, buildings: Building[], z
   if (!zones.length) return 0;
   const xs = zones.flatMap((zone) => zone.points.map((value) => value.x));
   const ys = zones.flatMap((zone) => zone.points.map((value) => value.y));
-  const step = 300;
+  const width = Math.max(...xs) - Math.min(...xs);
+  const depth = Math.max(...ys) - Math.min(...ys);
+  const step = Math.max(300, Math.sqrt((width * depth) / 2500));
+  const active = buildings.filter((building) => altitudeFt < building.heightFt + 1000);
+  const screened = active.length > 500 ? groupDenseBuildings(active) : active;
   let flagged = 0;
   for (let x = Math.min(...xs); x <= Math.max(...xs); x += step) {
     for (let y = Math.min(...ys); y <= Math.max(...ys); y += step) {
-      if (evaluatePoint({ x, y }, altitudeFt, buildings, zones).state === "conflict") flagged += 1;
+      const sample = { x, y };
+      if (!zones.some((zone) => pointInPolygon(sample, zone.points))) continue;
+      if (altitudeFt < 1000 || screened.some((building) => distanceToBuilding(sample, building) <= 2000)) flagged += 1;
     }
   }
   return (flagged * step * step) / 27_878_400;
@@ -376,7 +382,10 @@ export function AirspacePlanner() {
   const check = useMemo(() => evaluatePoint(selected, altitudeFt, buildings, zones), [selected, altitudeFt, buildings, zones]);
   const activeObstacles = useMemo(() => buildings.filter((building) => altitudeFt < building.heightFt + 1000).length, [altitudeFt, buildings]);
   const flaggedSquareMiles = useMemo(() => estimateFlaggedSquareMiles(altitudeFt, buildings, zones), [altitudeFt, buildings, zones]);
-  const buildingsGeoJson = useMemo(() => featureCollection(buildings.map((building) => buildingFeature(building, origin))), [buildings, origin]);
+  const buildingsGeoJson = useMemo(
+    () => sourceMode === "local" ? featureCollection(buildings.map((building) => buildingFeature(building, origin))) : emptyFeatures(),
+    [buildings, origin, sourceMode],
+  );
   const zonesGeoJson = useMemo(() => featureCollection(zones.map((zone) => zoneFeature(zone, origin))), [zones, origin]);
   const selectedGeoJson = useMemo(() => featureCollection([point(localToLngLat(selected, origin), { state: check.state })]), [selected, origin, check.state]);
   const conflictsGeoJson = useMemo(() => {
@@ -451,7 +460,7 @@ export function AirspacePlanner() {
           setDataNote("Zoom to neighborhood level to load building envelopes");
           return;
         }
-        const zoom = map.getZoom() >= 13.5 ? 14 : 13;
+        const zoom = 14;
         const bounds = map.getBounds();
         const maxTile = (2 ** zoom) - 1;
         const minX = Math.max(0, Math.min(maxTile, tileX(bounds.getWest(), zoom)));
@@ -462,7 +471,7 @@ export function AirspacePlanner() {
         for (let x = minX; x <= maxX; x += 1) {
           for (let y = minY; y <= maxY; y += 1) coordinates.push({ x, y });
         }
-        if (!coordinates.length || coordinates.length > 24) {
+        if (!coordinates.length || coordinates.length > 8) {
           source.setData(emptyFeatures());
           setBuildings([]);
           setDataNote("Zoom in to load a smaller set of building tiles");
@@ -473,8 +482,8 @@ export function AirspacePlanner() {
           const tiles = await Promise.all(coordinates.map(async ({ x, y }) => ({ x, y, tile: await archive.getZxy(zoom, x, y) })));
           if (disposed || requestId !== loadSerial) return;
           const decoded: Array<Feature<Polygon | MultiPolygon>> = [];
-          tiles.forEach(({ x, y, tile }) => {
-            if (!tile) return;
+          for (const { x, y, tile } of tiles) {
+            if (!tile) continue;
             const vectorTile = new VectorTile(new PbfReader(new Uint8Array(tile.data)));
             (["building", "building_part"] as const).forEach((sourceLayer) => {
               const layer = vectorTile.layers[sourceLayer];
@@ -484,6 +493,9 @@ export function AirspacePlanner() {
                 const geojson = vectorFeature.toGeoJSON(x, y, zoom);
                 if (geojson.geometry.type !== "Polygon" && geojson.geometry.type !== "MultiPolygon") continue;
                 const raw = (geojson.properties || {}) as Record<string, unknown>;
+                const isUnderground = raw.is_underground === true || raw.is_underground === "true";
+                const hasParts = raw.has_parts === true || raw.has_parts === "true";
+                if (isUnderground || (sourceLayer === "building" && hasParts)) continue;
                 const height = propertyHeight(raw);
                 geojson.properties = {
                   id: raw.id || vectorFeature.id || `${zoom}/${x}/${y}/${sourceLayer}/${index}`,
@@ -501,7 +513,9 @@ export function AirspacePlanner() {
                 decoded.push(geojson as Feature<Polygon | MultiPolygon>);
               }
             });
-          });
+            await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+            if (disposed || requestId !== loadSerial) return;
+          }
           const nextBuildings = overtureBuildingsFromFeatures(decoded, nextOrigin);
           const measured = nextBuildings.filter((building) => building.heightSource !== "30 ft fallback").length;
           source.setData(featureCollection(decoded));
@@ -573,7 +587,7 @@ export function AirspacePlanner() {
     if (!mapReady || !mapRef.current) return;
     (mapRef.current.getSource("clearance-zones") as GeoJSONSource)?.setData(zonesGeoJson);
     (mapRef.current.getSource("clearance-conflicts") as GeoJSONSource)?.setData(conflictsGeoJson);
-    (mapRef.current.getSource("clearance-buildings") as GeoJSONSource)?.setData(sourceMode === "local" ? buildingsGeoJson : emptyFeatures());
+    (mapRef.current.getSource("clearance-buildings") as GeoJSONSource)?.setData(buildingsGeoJson);
     (mapRef.current.getSource("clearance-selected") as GeoJSONSource)?.setData(selectedGeoJson);
     ["clearance-building-fill", "clearance-building-line"].forEach((id) => {
       if (mapRef.current?.getLayer(id)) mapRef.current.setLayoutProperty(id, "visibility", sourceMode === "local" ? "visible" : "none");
