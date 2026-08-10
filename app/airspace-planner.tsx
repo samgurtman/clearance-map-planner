@@ -25,6 +25,8 @@ type Building = Point & {
   groundElevationFt?: number;
 };
 type Zone = { id: string; label: string; points: Point[]; source: string };
+type RenderBounds = { west: number; east: number; south: number; north: number };
+type RenderProgress = { active: boolean; value: number; label: string };
 type TerrainCell = {
   id: string;
   zoom: number;
@@ -50,8 +52,8 @@ type Check = {
   envelopeDistanceFt?: number;
 };
 type ImportedDataset = { buildings: Building[]; origin: Origin; note: string };
-type CoverageStatus = "loading" | "ready" | "zoom-required" | "error";
-type TerrainStatus = "loading" | "ready" | "zoom-required" | "error";
+type CoverageStatus = "idle" | "loading" | "ready" | "zoom-required" | "error";
+type TerrainStatus = "idle" | "loading" | "ready" | "zoom-required" | "error";
 type Basemap = "street" | "sectional";
 
 const CHICAGO_ORIGIN: Origin = { lat: 41.8819, lon: -87.6324 };
@@ -658,9 +660,10 @@ function terrainCellId(zoom: number, tileColumn: number, tileRow: number, cellCo
   return `${zoom}/${tileColumn}/${tileRow}/${cellColumn}/${cellRow}`;
 }
 
-async function terrainCellsFromTiles(tiles: Array<{ x: number; y: number; raster: TerrainRaster }>, zoom: number) {
+async function terrainCellsFromTiles(tiles: Array<{ x: number; y: number; raster: TerrainRaster }>, zoom: number, onProgress?: (value: number) => void) {
   const cells: TerrainCell[] = [];
-  for (const { x, y, raster } of tiles) {
+  for (let tileIndex = 0; tileIndex < tiles.length; tileIndex += 1) {
+    const { x, y, raster } = tiles[tileIndex];
     const maxima = new Array<number>(TERRAIN_CELL_DIVISIONS * TERRAIN_CELL_DIVISIONS).fill(-Infinity);
     for (let pixelY = 0; pixelY < raster.height; pixelY += 1) {
       const cellY = Math.min(TERRAIN_CELL_DIVISIONS - 1, Math.floor((pixelY / raster.height) * TERRAIN_CELL_DIVISIONS));
@@ -697,6 +700,7 @@ async function terrainCellsFromTiles(tiles: Array<{ x: number; y: number; raster
       }
     }
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    onProgress?.((tileIndex + 1) / tiles.length);
   }
   return cells;
 }
@@ -735,31 +739,65 @@ function terrainCellFeature(cell: TerrainCell) {
   });
 }
 
-function viewportStudyZone(map: MapLibreMap, origin: Origin): Zone {
-  const bounds = map.getBounds();
-  const west = bounds.getWest();
-  const east = bounds.getEast();
-  const south = bounds.getSouth();
-  const north = bounds.getNorth();
+function boundsStudyZone(bounds: RenderBounds, origin: Origin): Zone {
   return {
-    id: "visible-study-area",
-    label: "Visible conservative study area",
-    source: "Current viewport; not an FAA designation",
+    id: "rendered-study-area",
+    label: "Selected conservative study area",
+    source: "User-selected bounds; not an FAA designation",
     points: [
-      lngLatToLocal(west, north, origin),
-      lngLatToLocal(east, north, origin),
-      lngLatToLocal(east, south, origin),
-      lngLatToLocal(west, south, origin),
+      lngLatToLocal(bounds.west, bounds.north, origin),
+      lngLatToLocal(bounds.east, bounds.north, origin),
+      lngLatToLocal(bounds.east, bounds.south, origin),
+      lngLatToLocal(bounds.west, bounds.south, origin),
     ],
   };
+}
+
+function normalizedBounds(first: [number, number], second: [number, number]): RenderBounds {
+  return {
+    west: Math.min(first[0], second[0]),
+    east: Math.max(first[0], second[0]),
+    south: Math.min(first[1], second[1]),
+    north: Math.max(first[1], second[1]),
+  };
+}
+
+function mapViewportBounds(map: MapLibreMap): RenderBounds {
+  const bounds = map.getBounds();
+  return { west: bounds.getWest(), east: bounds.getEast(), south: bounds.getSouth(), north: bounds.getNorth() };
+}
+
+function boundsForZone(zone: Zone, origin: Origin): RenderBounds {
+  const coordinates = zone.points.map((value) => localToLngLat(value, origin));
+  return {
+    west: Math.min(...coordinates.map(([lon]) => lon)),
+    east: Math.max(...coordinates.map(([lon]) => lon)),
+    south: Math.min(...coordinates.map(([, lat]) => lat)),
+    north: Math.max(...coordinates.map(([, lat]) => lat)),
+  };
+}
+
+function boundsFeature(bounds: RenderBounds, properties: Record<string, unknown> = {}) {
+  return polygon([[
+    [bounds.west, bounds.north],
+    [bounds.east, bounds.north],
+    [bounds.east, bounds.south],
+    [bounds.west, bounds.south],
+    [bounds.west, bounds.north],
+  ]], properties);
+}
+
+function terrainCellIntersectsBounds(cell: TerrainCell, bounds: RenderBounds) {
+  return cell.west < bounds.east && cell.east > bounds.west && cell.south < bounds.north && cell.north > bounds.south;
 }
 
 export function AirspacePlanner() {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const overtureReloadRef = useRef<() => void>(() => {});
-  const terrainReloadRef = useRef<() => void>(() => {});
+  const renderAreaRef = useRef<(bounds: RenderBounds) => Promise<boolean>>(async () => false);
+  const drawingAreaRef = useRef(false);
+  const selectionStartRef = useRef<[number, number] | null>(null);
   const coverageBoundsRef = useRef<{ west: number; east: number; south: number; north: number } | null>(null);
   const terrainCoverageBoundsRef = useRef<{ west: number; east: number; south: number; north: number } | null>(null);
   const loadedTileKeyRef = useRef<string | null>(null);
@@ -773,11 +811,11 @@ export function AirspacePlanner() {
   const [zones, setZones] = useState<Zone[]>([]);
   const [origin, setOrigin] = useState<Origin>(CHICAGO_ORIGIN);
   const [datasetName, setDatasetName] = useState("Overture Maps · automatic");
-  const [dataNote, setDataNote] = useState("Loading visible building tiles…");
-  const [coverageStatus, setCoverageStatus] = useState<CoverageStatus>("loading");
+  const [dataNote, setDataNote] = useState("Select an area, then render building coverage");
+  const [coverageStatus, setCoverageStatus] = useState<CoverageStatus>("idle");
   const [terrainCells, setTerrainCells] = useState<TerrainCell[]>([]);
-  const [terrainStatus, setTerrainStatus] = useState<TerrainStatus>("loading");
-  const [terrainNote, setTerrainNote] = useState("Loading bare-earth elevation tiles…");
+  const [terrainStatus, setTerrainStatus] = useState<TerrainStatus>("idle");
+  const [terrainNote, setTerrainNote] = useState("Surface elevations render only for the selected area");
   const [sourceMode, setSourceMode] = useState<"overture" | "local">("overture");
   const [overtureRelease, setOvertureRelease] = useState(OVERTURE_FALLBACK_RELEASE);
   const [selectedLngLat, setSelectedLngLat] = useState<[number, number]>(localToLngLat({ x: 80, y: 160 }, CHICAGO_ORIGIN));
@@ -787,17 +825,40 @@ export function AirspacePlanner() {
   const [mapReady, setMapReady] = useState(false);
   const [basemapError, setBasemapError] = useState(false);
   const [basemap, setBasemap] = useState<Basemap>("street");
+  const [selectedBounds, setSelectedBounds] = useState<RenderBounds | null>(null);
+  const [renderedBounds, setRenderedBounds] = useState<RenderBounds | null>(null);
+  const [drawingArea, setDrawingArea] = useState(false);
+  const [renderProgress, setRenderProgress] = useState<RenderProgress>({ active: false, value: 0, label: "Ready" });
+  const [renderError, setRenderError] = useState("");
 
   useEffect(() => {
     liveDataRef.current = { altitudeFt, buildings, zones, origin, sourceMode };
   }, [altitudeFt, buildings, zones, origin, sourceMode]);
+
+  useEffect(() => {
+    drawingAreaRef.current = drawingArea;
+    if (!mapRef.current) return;
+    if (drawingArea) mapRef.current.dragPan.disable();
+    else mapRef.current.dragPan.enable();
+  }, [drawingArea]);
+
+  useEffect(() => {
+    if (!drawingArea) return;
+    const cancelDrawing = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      selectionStartRef.current = null;
+      setDrawingArea(false);
+    };
+    window.addEventListener("keydown", cancelDrawing);
+    return () => window.removeEventListener("keydown", cancelDrawing);
+  }, [drawingArea]);
 
   const selected = useMemo(() => lngLatToLocal(selectedLngLat[0], selectedLngLat[1], origin), [selectedLngLat, origin]);
   const terrainIndex = useMemo(() => new Map(terrainCells.map((cell) => [cell.id, cell])), [terrainCells]);
   const modeledBuildings = useMemo(() => addGroundElevations(buildings, origin, terrainIndex), [buildings, origin, terrainIndex]);
   const selectedSurfaceElevationFt = useMemo(() => terrainElevationAtLngLat(selectedLngLat[0], selectedLngLat[1], terrainIndex), [selectedLngLat, terrainIndex]);
   const buildingCoverageAvailable = sourceMode === "local" || coverageStatus === "ready";
-  const modelAvailable = buildingCoverageAvailable && terrainStatus === "ready";
+  const modelAvailable = Boolean(renderedBounds) && buildingCoverageAvailable && terrainStatus === "ready";
   const check = useMemo<Check>(
     () => modelAvailable ? evaluatePoint(selected, altitudeFt, modeledBuildings, zones, selectedSurfaceElevationFt) : { state: "unavailable" },
     [modelAvailable, selected, altitudeFt, modeledBuildings, zones, selectedSurfaceElevationFt],
@@ -812,12 +873,13 @@ export function AirspacePlanner() {
     [modeledBuildings, origin, sourceMode],
   );
   const zonesGeoJson = useMemo(() => featureCollection(zones.map((zone) => zoneFeature(zone, origin))), [zones, origin]);
+  const selectionGeoJson = useMemo(() => selectedBounds ? featureCollection([boundsFeature(selectedBounds, { state: "selection" })]) : emptyFeatures(), [selectedBounds]);
   const selectedGeoJson = useMemo(() => featureCollection([point(localToLngLat(selected, origin), { state: check.state })]), [selected, origin, check.state]);
   const conflictsGeoJson = useMemo(() => {
     if (!modelAvailable) return emptyFeatures();
     const features: Array<Feature<Polygon | MultiPolygon>> = [];
     terrainCells.forEach((cell) => {
-      if (altitudeFt < cell.elevationFt + 1000) features.push(terrainCellFeature(cell));
+      if (renderedBounds && terrainCellIntersectsBounds(cell, renderedBounds) && altitudeFt < cell.elevationFt + 1000) features.push(terrainCellFeature(cell));
     });
     const active = modeledBuildings.filter((building) => {
       const topElevationFt = buildingTopElevationFt(building);
@@ -837,13 +899,14 @@ export function AirspacePlanner() {
       });
     });
     return featureCollection(features);
-  }, [modelAvailable, altitudeFt, modeledBuildings, terrainCells, zones, origin]);
+  }, [modelAvailable, altitudeFt, modeledBuildings, terrainCells, renderedBounds, zones, origin]);
 
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) return;
     let disposed = false;
     let loadSerial = 0;
     let terrainLoadSerial = 0;
+    let areaRenderSerial = 0;
     Promise.all([
       import("maplibre-gl"),
       import("pmtiles"),
@@ -903,16 +966,15 @@ export function AirspacePlanner() {
       });
       mapRef.current = map;
 
-      const loadVisibleTerrainTiles = async () => {
-        const center = map.getCenter();
-        const viewportBounds = map.getBounds();
+      const loadVisibleTerrainTiles = async (selection: RenderBounds, onProgress?: (value: number) => void) => {
+        const center = { lat: (selection.south + selection.north) / 2, lng: (selection.west + selection.east) / 2 };
         const clearanceLatPadding = CLEARANCE_DISTANCE_FT / FEET_PER_LAT_DEGREE;
         const clearanceLonPadding = CLEARANCE_DISTANCE_FT / Math.max(1, feetPerLonDegree(center.lat));
         const requiredCoverage = {
-          west: viewportBounds.getWest() - clearanceLonPadding,
-          east: viewportBounds.getEast() + clearanceLonPadding,
-          south: viewportBounds.getSouth() - clearanceLatPadding,
-          north: viewportBounds.getNorth() + clearanceLatPadding,
+          west: selection.west - clearanceLonPadding,
+          east: selection.east + clearanceLonPadding,
+          south: selection.south - clearanceLatPadding,
+          north: selection.north + clearanceLatPadding,
         };
         const previousCoverage = terrainCoverageBoundsRef.current;
         const alreadyCovered = Boolean(previousCoverage
@@ -934,7 +996,8 @@ export function AirspacePlanner() {
             setTerrainNote("Using already-loaded bare-earth elevation coverage");
           }
           setTerrainStatus("ready");
-          return;
+          onProgress?.(1);
+          return true;
         }
         const maxTile = (2 ** TERRAIN_TILE_ZOOM) - 1;
         const minX = Math.max(0, Math.min(maxTile, tileX(requiredCoverage.west, TERRAIN_TILE_ZOOM)));
@@ -945,8 +1008,8 @@ export function AirspacePlanner() {
         if (visibleTileCount <= 0 || visibleTileCount > MAX_VISIBLE_OVERTURE_TILES) {
           clearTerrain();
           setTerrainStatus("zoom-required");
-          setTerrainNote(`Surface coverage spans ${visibleTileCount.toLocaleString()} elevation tiles · narrow the view to ${MAX_VISIBLE_OVERTURE_TILES} or fewer`);
-          return;
+          setTerrainNote(`Selected area spans ${visibleTileCount.toLocaleString()} elevation tiles · select an area using ${MAX_VISIBLE_OVERTURE_TILES} or fewer`);
+          return false;
         }
         const coordinates: Array<{ x: number; y: number }> = [];
         for (let x = minX; x <= maxX; x += 1) {
@@ -961,30 +1024,35 @@ export function AirspacePlanner() {
             north: Math.max(previousCoverage?.north ?? requiredCoverage.north, requiredCoverage.north),
           };
           setTerrainStatus("ready");
-          return;
+          onProgress?.(1);
+          return true;
         }
-        if (pendingTerrainTileKeyRef.current === tileKey) return;
+        if (pendingTerrainTileKeyRef.current === tileKey) return false;
         const requestId = ++terrainLoadSerial;
         pendingTerrainTileKeyRef.current = tileKey;
         setTerrainStatus("loading");
         setTerrainNote(`Loading ${coordinates.length} bare-earth elevation tile${coordinates.length === 1 ? "" : "s"}…`);
         try {
-          const loaded = await mapWithConcurrency(coordinates, TERRAIN_FETCH_CONCURRENCY, async ({ x, y }) => ({
-            x,
-            y,
-            raster: await loadTerrainTile(TERRAIN_TILE_ZOOM, x, y),
-          }));
-          if (disposed || requestId !== terrainLoadSerial) return;
+          let fetched = 0;
+          const loaded = await mapWithConcurrency(coordinates, TERRAIN_FETCH_CONCURRENCY, async ({ x, y }) => {
+            const raster = await loadTerrainTile(TERRAIN_TILE_ZOOM, x, y);
+            fetched += 1;
+            onProgress?.(0.45 * (fetched / coordinates.length));
+            return { x, y, raster };
+          });
+          if (disposed || requestId !== terrainLoadSerial) return false;
           if (loaded.some(({ raster }) => !raster)) throw new Error("One or more terrain tiles were unavailable.");
           const completeTiles = loaded as Array<{ x: number; y: number; raster: TerrainRaster }>;
-          const cells = await terrainCellsFromTiles(completeTiles, TERRAIN_TILE_ZOOM);
-          if (disposed || requestId !== terrainLoadSerial) return;
+          const cells = await terrainCellsFromTiles(completeTiles, TERRAIN_TILE_ZOOM, (value) => onProgress?.(0.45 + value * 0.55));
+          if (disposed || requestId !== terrainLoadSerial) return false;
           setTerrainCells(cells);
           loadedTerrainTileKeyRef.current = tileKey;
           pendingTerrainTileKeyRef.current = null;
           terrainCoverageBoundsRef.current = requiredCoverage;
           setTerrainStatus("ready");
           setTerrainNote(`${cells.length.toLocaleString()} conservative surface cells · ${coordinates.length} z${TERRAIN_TILE_ZOOM} elevation tile${coordinates.length === 1 ? "" : "s"}`);
+          onProgress?.(1);
+          return true;
         } catch (error) {
           console.error("Terrain tile load failed", error);
           if (!disposed && requestId === terrainLoadSerial) {
@@ -992,29 +1060,28 @@ export function AirspacePlanner() {
             setTerrainStatus("error");
             setTerrainNote("Bare-earth elevation tiles could not be reached. Reload to try again.");
           }
+          return false;
         }
       };
-      terrainReloadRef.current = () => { void loadVisibleTerrainTiles(); };
 
-      const loadVisibleBuildingTiles = async () => {
-        if (liveDataRef.current.sourceMode !== "overture" || !map.getSource("overture-buildings")) return;
-        const center = map.getCenter();
+      const loadVisibleBuildingTiles = async (selection: RenderBounds, onProgress?: (value: number) => void) => {
+        if (liveDataRef.current.sourceMode !== "overture" || !map.getSource("overture-buildings")) return false;
+        const center = { lat: (selection.south + selection.north) / 2, lng: (selection.west + selection.east) / 2 };
         const nextOrigin = { lat: center.lat, lon: center.lng };
         const source = map.getSource("overture-buildings") as GeoJSONSource;
-        const viewportBounds = map.getBounds();
         const viewportKey = [
-          viewportBounds.getWest(),
-          viewportBounds.getSouth(),
-          viewportBounds.getEast(),
-          viewportBounds.getNorth(),
+          selection.west,
+          selection.south,
+          selection.east,
+          selection.north,
         ].map((value) => value.toFixed(6)).join(":");
         const clearanceLatPadding = CLEARANCE_DISTANCE_FT / FEET_PER_LAT_DEGREE;
         const clearanceLonPadding = CLEARANCE_DISTANCE_FT / Math.max(1, feetPerLonDegree(center.lat));
         const requiredCoverage = {
-          west: viewportBounds.getWest() - clearanceLonPadding,
-          east: viewportBounds.getEast() + clearanceLonPadding,
-          south: viewportBounds.getSouth() - clearanceLatPadding,
-          north: viewportBounds.getNorth() + clearanceLatPadding,
+          west: selection.west - clearanceLonPadding,
+          east: selection.east + clearanceLonPadding,
+          south: selection.south - clearanceLatPadding,
+          north: selection.north + clearanceLatPadding,
         };
         const previousCoverage = coverageBoundsRef.current;
         const viewportAlreadyCovered = Boolean(previousCoverage
@@ -1031,7 +1098,7 @@ export function AirspacePlanner() {
           source.setData(emptyFeatures());
           setOrigin(nextOrigin);
           setBuildings([]);
-          setZones([viewportStudyZone(map, nextOrigin)]);
+          setZones([boundsStudyZone(selection, nextOrigin)]);
         };
         if (viewportAlreadyCovered && loadedTileKeyRef.current) {
           const cancelledRefresh = Boolean(pendingTileKeyRef.current);
@@ -1040,11 +1107,12 @@ export function AirspacePlanner() {
             pendingTileKeyRef.current = null;
           }
           const stableOrigin = liveDataRef.current.origin;
-          setZones([viewportStudyZone(map, stableOrigin)]);
+          setZones([boundsStudyZone(selection, stableOrigin)]);
           loadedViewportKeyRef.current = viewportKey;
           setCoverageStatus("ready");
           if (cancelledRefresh) setDataNote("Using already-loaded full-detail coverage · no tile reload needed");
-          return;
+          onProgress?.(1);
+          return true;
         }
         const zoom = fullTileZoom;
         const maxTile = (2 ** zoom) - 1;
@@ -1056,8 +1124,8 @@ export function AirspacePlanner() {
         if (visibleTileCount <= 0 || visibleTileCount > MAX_VISIBLE_OVERTURE_TILES) {
           clearCoverage();
           setCoverageStatus("zoom-required");
-          setDataNote(`Visible area plus the 2,000-ft clearance halo spans ${visibleTileCount.toLocaleString()} full-detail tiles · narrow the view to ${MAX_VISIBLE_OVERTURE_TILES} or fewer`);
-          return;
+          setDataNote(`Selected area plus the 2,000-ft clearance halo spans ${visibleTileCount.toLocaleString()} full-detail tiles · select an area using ${MAX_VISIBLE_OVERTURE_TILES} or fewer`);
+          return false;
         }
         const coordinates: Array<{ x: number; y: number }> = [];
         for (let x = minX; x <= maxX; x += 1) {
@@ -1067,7 +1135,7 @@ export function AirspacePlanner() {
         if (loadedTileKeyRef.current === tileKey) {
           if (loadedViewportKeyRef.current !== viewportKey) {
             const stableOrigin = liveDataRef.current.origin;
-            setZones([viewportStudyZone(map, stableOrigin)]);
+            setZones([boundsStudyZone(selection, stableOrigin)]);
             coverageBoundsRef.current = {
               west: Math.min(previousCoverage?.west ?? requiredCoverage.west, requiredCoverage.west),
               east: Math.max(previousCoverage?.east ?? requiredCoverage.east, requiredCoverage.east),
@@ -1077,25 +1145,29 @@ export function AirspacePlanner() {
             loadedViewportKeyRef.current = viewportKey;
           }
           setCoverageStatus("ready");
-          return;
+          onProgress?.(1);
+          return true;
         }
-        if (pendingTileKeyRef.current === tileKey) return;
+        if (pendingTileKeyRef.current === tileKey) return false;
         const requestId = ++loadSerial;
         pendingTileKeyRef.current = tileKey;
-        setCoverageStatus(viewportAlreadyCovered ? "ready" : "loading");
-        setDataNote(`Loading ${coordinates.length} visible Overture tile${coordinates.length === 1 ? "" : "s"}…`);
+        setCoverageStatus("loading");
+        setDataNote(`Loading ${coordinates.length} selected-area Overture tile${coordinates.length === 1 ? "" : "s"}…`);
         try {
-          const tiles = await Promise.all(coordinates.map(async ({ x, y }) => ({
-            x,
-            y,
-            tile: await loadCachedOvertureTile(
+          let fetched = 0;
+          const tiles = await Promise.all(coordinates.map(async ({ x, y }) => {
+            const tile = await loadCachedOvertureTile(
               `${release}:${zoom}/${x}/${y}`,
               async () => (await archive.getZxy(zoom, x, y))?.data || null,
-            ),
-          })));
-          if (disposed || requestId !== loadSerial) return;
+            );
+            fetched += 1;
+            onProgress?.(0.45 * (fetched / coordinates.length));
+            return { x, y, tile };
+          }));
+          if (disposed || requestId !== loadSerial) return false;
           const decoded: Array<Feature<Polygon | MultiPolygon>> = [];
-          for (const { x, y, tile } of tiles) {
+          for (let tileIndex = 0; tileIndex < tiles.length; tileIndex += 1) {
+            const { x, y, tile } = tiles[tileIndex];
             if (!tile) continue;
             const vectorTile = new VectorTile(new PbfReader(new Uint8Array(tile)));
             (["building", "building_part"] as const).forEach((sourceLayer) => {
@@ -1127,21 +1199,24 @@ export function AirspacePlanner() {
               }
             });
             await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-            if (disposed || requestId !== loadSerial) return;
+            onProgress?.(0.45 + 0.55 * ((tileIndex + 1) / tiles.length));
+            if (disposed || requestId !== loadSerial) return false;
           }
           const nextBuildings = overtureBuildingsFromFeatures(decoded, nextOrigin);
           const measured = nextBuildings.filter((building) => building.heightSource !== "30 ft fallback").length;
           source.setData(featureCollection(decoded));
           setOrigin(nextOrigin);
           setBuildings(nextBuildings);
-          setZones([viewportStudyZone(map, nextOrigin)]);
+          setZones([boundsStudyZone(selection, nextOrigin)]);
           loadedTileKeyRef.current = tileKey;
           loadedViewportKeyRef.current = viewportKey;
           pendingTileKeyRef.current = null;
           coverageBoundsRef.current = requiredCoverage;
           setCoverageStatus("ready");
           setDatasetName(`Overture Maps · ${release}`);
-          setDataNote(`${nextBuildings.length.toLocaleString()} visible envelopes · ${measured.toLocaleString()} with height/floor data · ${coordinates.length} full-detail z${zoom} tile${coordinates.length === 1 ? "" : "s"}`);
+          setDataNote(`${nextBuildings.length.toLocaleString()} selected-area envelopes · ${measured.toLocaleString()} with height/floor data · ${coordinates.length} full-detail z${zoom} tile${coordinates.length === 1 ? "" : "s"}`);
+          onProgress?.(1);
+          return true;
         } catch (error) {
           console.error("Overture building tile load failed", error);
           if (!disposed && requestId === loadSerial) {
@@ -1155,18 +1230,56 @@ export function AirspacePlanner() {
               setDataNote("Overture building tiles could not be reached. Reload to try again.");
             }
           }
+          return false;
         }
       };
-      overtureReloadRef.current = () => { void loadVisibleBuildingTiles(); };
+
+      renderAreaRef.current = async (selection: RenderBounds) => {
+        const renderId = ++areaRenderSerial;
+        setRenderError("");
+        setRenderedBounds(null);
+        setTerrainStatus("loading");
+        setTerrainNote("Waiting to render surface elevations…");
+        setRenderProgress({ active: true, value: 2, label: "Preparing selected area" });
+        let buildingsReady = true;
+        if (liveDataRef.current.sourceMode === "overture") {
+          buildingsReady = await loadVisibleBuildingTiles(selection, (value) => {
+            if (renderId === areaRenderSerial) setRenderProgress({ active: true, value: Math.round(2 + value * 47), label: value < 0.45 ? "Loading building tiles" : "Decoding building envelopes" });
+          });
+        } else {
+          const stableOrigin = liveDataRef.current.origin;
+          setZones([boundsStudyZone(selection, stableOrigin)]);
+          setCoverageStatus("ready");
+          setRenderProgress({ active: true, value: 49, label: "Local building envelopes ready" });
+        }
+        if (!buildingsReady || disposed || renderId !== areaRenderSerial) {
+          if (!disposed && renderId === areaRenderSerial) {
+            setRenderError("The selected building coverage could not be rendered.");
+            setRenderProgress({ active: false, value: 0, label: "Render failed" });
+          }
+          return false;
+        }
+        const terrainReady = await loadVisibleTerrainTiles(selection, (value) => {
+          if (renderId === areaRenderSerial) setRenderProgress({ active: true, value: Math.round(50 + value * 49), label: value < 0.45 ? "Loading elevation tiles" : "Screening surface elevations" });
+        });
+        if (!terrainReady || disposed || renderId !== areaRenderSerial) {
+          if (!disposed && renderId === areaRenderSerial) {
+            setRenderError("The selected surface coverage could not be rendered.");
+            setRenderProgress({ active: false, value: 0, label: "Render failed" });
+          }
+          return false;
+        }
+        setRenderedBounds(selection);
+        setSelectedLngLat([(selection.west + selection.east) / 2, (selection.south + selection.north) / 2]);
+        setRenderProgress({ active: true, value: 100, label: "Render complete" });
+        setTimeout(() => {
+          if (!disposed && renderId === areaRenderSerial) setRenderProgress({ active: false, value: 100, label: "Render complete" });
+        }, 700);
+        return true;
+      };
 
       map.on("style.load", () => {
-        setMapReady(true);
         setBasemapError(false);
-        setCoverageStatus("loading");
-        setTerrainStatus("loading");
-        setDataNote("Connecting to Overture building archive…");
-        setTerrainNote("Connecting to bare-earth elevation tiles…");
-        void loadVisibleTerrainTiles();
         requestAnimationFrame(async () => {
           try {
             const header = await archive.getHeader();
@@ -1177,8 +1290,11 @@ export function AirspacePlanner() {
             map.addSource("clearance-conflicts", { type: "geojson", data: emptyFeatures() });
             map.addSource("clearance-buildings", { type: "geojson", data: emptyFeatures() });
             map.addSource("clearance-selected", { type: "geojson", data: emptyFeatures() });
+            map.addSource("clearance-selection", { type: "geojson", data: emptyFeatures() });
             map.addLayer({ id: "clearance-zone-fill", type: "fill", source: "clearance-zones", paint: { "fill-color": "#c08a2c", "fill-opacity": 0.07 } }, beforeId);
             map.addLayer({ id: "clearance-zone-line", type: "line", source: "clearance-zones", paint: { "line-color": "#8f6b28", "line-width": 1.25, "line-dasharray": [3, 2] } }, beforeId);
+            map.addLayer({ id: "clearance-selection-fill", type: "fill", source: "clearance-selection", paint: { "fill-color": "#276f9e", "fill-opacity": 0.08 } }, beforeId);
+            map.addLayer({ id: "clearance-selection-line", type: "line", source: "clearance-selection", paint: { "line-color": "#276f9e", "line-width": 2, "line-dasharray": [2, 1.5] } }, beforeId);
             map.addLayer({ id: "clearance-conflict-fill", type: "fill", source: "clearance-conflicts", paint: { "fill-color": "#df3d33", "fill-opacity": 0.25 } }, beforeId);
             map.addLayer({ id: "clearance-conflict-line", type: "line", source: "clearance-conflicts", filter: ["!", ["has", "source"]], paint: { "line-color": "#bd3028", "line-width": 1 } }, beforeId);
             map.addLayer({ id: "overture-building-fill", type: "fill", source: "overture-buildings", filter: ["==", ["get", "__sourceLayer"], "building"], paint: { "fill-color": ["step", ["get", "__renderHeightM"], "#89908e", 107, "#4e585c", 244, "#182229"], "fill-opacity": 0.84 } }, beforeId);
@@ -1188,7 +1304,9 @@ export function AirspacePlanner() {
             map.addLayer({ id: "clearance-building-line", type: "line", source: "clearance-buildings", paint: { "line-color": "#ffffff", "line-width": 0.65, "line-opacity": 0.72 } }, beforeId);
             map.addLayer({ id: "clearance-selected-outer", type: "circle", source: "clearance-selected", paint: { "circle-radius": 10, "circle-color": "#fffdf7", "circle-stroke-width": 4, "circle-stroke-color": ["match", ["get", "state"], "conflict", "#d82f29", "clear", "#176b59", "unavailable", "#c08a2c", "#182229"] } });
             map.addLayer({ id: "clearance-selected-inner", type: "circle", source: "clearance-selected", paint: { "circle-radius": 3, "circle-color": ["match", ["get", "state"], "conflict", "#d82f29", "clear", "#176b59", "unavailable", "#c08a2c", "#182229"] } });
-            void loadVisibleBuildingTiles();
+            setCoverageStatus("idle");
+            setTerrainStatus("idle");
+            setMapReady(true);
           } catch (error) {
             console.error("Clearance map layer setup failed", error);
             setCoverageStatus("error");
@@ -1196,11 +1314,32 @@ export function AirspacePlanner() {
           }
         });
       });
-      map.on("moveend", () => {
-        void loadVisibleBuildingTiles();
-        void loadVisibleTerrainTiles();
+      let suppressNextClick = false;
+      map.on("mousedown", (event) => {
+        if (!drawingAreaRef.current) return;
+        event.preventDefault();
+        selectionStartRef.current = [event.lngLat.lng, event.lngLat.lat];
+        setSelectedBounds(normalizedBounds(selectionStartRef.current, selectionStartRef.current));
+      });
+      map.on("mousemove", (event) => {
+        if (!drawingAreaRef.current || !selectionStartRef.current) return;
+        setSelectedBounds(normalizedBounds(selectionStartRef.current, [event.lngLat.lng, event.lngLat.lat]));
+      });
+      map.on("mouseup", (event) => {
+        if (!drawingAreaRef.current || !selectionStartRef.current) return;
+        setSelectedBounds(normalizedBounds(selectionStartRef.current, [event.lngLat.lng, event.lngLat.lat]));
+        selectionStartRef.current = null;
+        drawingAreaRef.current = false;
+        setDrawingArea(false);
+        map.dragPan.enable();
+        suppressNextClick = true;
       });
       map.on("click", (event) => {
+        if (suppressNextClick) {
+          suppressNextClick = false;
+          return;
+        }
+        if (drawingAreaRef.current) return;
         setSelectedLngLat([event.lngLat.lng, event.lngLat.lat]);
       });
       map.on("error", (event) => {
@@ -1215,8 +1354,10 @@ export function AirspacePlanner() {
       disposed = true;
       loadSerial += 1;
       terrainLoadSerial += 1;
-      overtureReloadRef.current = () => {};
-      terrainReloadRef.current = () => {};
+      areaRenderSerial += 1;
+      renderAreaRef.current = async () => false;
+      drawingAreaRef.current = false;
+      selectionStartRef.current = null;
       loadedTileKeyRef.current = null;
       loadedViewportKeyRef.current = null;
       pendingTileKeyRef.current = null;
@@ -1234,18 +1375,14 @@ export function AirspacePlanner() {
     (mapRef.current.getSource("clearance-conflicts") as GeoJSONSource)?.setData(conflictsGeoJson);
     (mapRef.current.getSource("clearance-buildings") as GeoJSONSource)?.setData(buildingsGeoJson);
     (mapRef.current.getSource("clearance-selected") as GeoJSONSource)?.setData(selectedGeoJson);
+    (mapRef.current.getSource("clearance-selection") as GeoJSONSource)?.setData(selectionGeoJson);
     ["clearance-building-fill", "clearance-building-line"].forEach((id) => {
       if (mapRef.current?.getLayer(id)) mapRef.current.setLayoutProperty(id, "visibility", sourceMode === "local" ? "visible" : "none");
     });
     ["overture-building-fill", "overture-building-part-fill", "overture-building-line"].forEach((id) => {
       if (mapRef.current?.getLayer(id)) mapRef.current.setLayoutProperty(id, "visibility", sourceMode === "overture" ? "visible" : "none");
     });
-  }, [mapReady, zonesGeoJson, conflictsGeoJson, buildingsGeoJson, selectedGeoJson, sourceMode]);
-
-  useEffect(() => {
-    if (mapReady && sourceMode === "overture") overtureReloadRef.current();
-    if (mapReady) terrainReloadRef.current();
-  }, [mapReady, sourceMode]);
+  }, [mapReady, zonesGeoJson, conflictsGeoJson, buildingsGeoJson, selectedGeoJson, selectionGeoJson, sourceMode]);
 
   useEffect(() => {
     if (!mapReady || !mapRef.current) return;
@@ -1270,15 +1407,20 @@ export function AirspacePlanner() {
       loadedTileKeyRef.current = null;
       loadedViewportKeyRef.current = null;
       pendingTileKeyRef.current = null;
-      setCoverageStatus("ready");
+      const importedZone = makeConservativeZone(imported.buildings, "Imported conservative study area");
+      setCoverageStatus("idle");
       setBuildings(imported.buildings);
       setOrigin(imported.origin);
-      setZones([makeConservativeZone(imported.buildings, "Imported conservative study area")]);
+      setZones([]);
+      setSelectedBounds(boundsForZone(importedZone, imported.origin));
+      setRenderedBounds(null);
       setDatasetName(file.name);
-      setDataNote(`${imported.buildings.length.toLocaleString()} buildings · ${imported.note}`);
+      setDataNote(`${imported.buildings.length.toLocaleString()} buildings · ${imported.note} · press Render`);
       setSelectedLngLat([imported.origin.lon, imported.origin.lat]);
-      setTerrainStatus("loading");
-      setTerrainNote("Loading surface elevations for the imported area…");
+      setTerrainCells([]);
+      setTerrainStatus("idle");
+      setTerrainNote("Surface elevations render only after you press Render");
+      setRenderError("");
       mapRef.current?.flyTo({ center: [imported.origin.lon, imported.origin.lat], zoom: 15, essential: true });
     } catch (error) {
       setImportError(error instanceof Error ? error.message : "This file could not be read.");
@@ -1295,15 +1437,43 @@ export function AirspacePlanner() {
     loadedTileKeyRef.current = null;
     loadedViewportKeyRef.current = null;
     pendingTileKeyRef.current = null;
-    setCoverageStatus("loading");
+    setCoverageStatus("idle");
     setBuildings([]);
     setOrigin(nextOrigin);
-    setZones(mapRef.current ? [viewportStudyZone(mapRef.current, nextOrigin)] : []);
+    setZones([]);
+    setSelectedBounds(mapRef.current ? mapViewportBounds(mapRef.current) : null);
+    setRenderedBounds(null);
     setDatasetName(`Overture Maps · ${overtureRelease}`);
-    setDataNote("Loading visible building tiles…");
+    setDataNote("Area selected · press Render to load building coverage");
     setSelectedLngLat([nextOrigin.lon, nextOrigin.lat]);
+    setTerrainCells([]);
+    setTerrainStatus("idle");
+    setTerrainNote("Surface elevations render only after you press Render");
     setImportError("");
+    setRenderError("");
     mapRef.current?.triggerRepaint();
+  }
+
+  function beginAreaSelection() {
+    if (!mapReady || renderProgress.active) return;
+    setRenderError("");
+    setDrawingArea((current) => !current);
+    selectionStartRef.current = null;
+  }
+
+  function useCurrentView() {
+    if (!mapRef.current || renderProgress.active) return;
+    setDrawingArea(false);
+    selectionStartRef.current = null;
+    setSelectedBounds(mapViewportBounds(mapRef.current));
+    setRenderError("");
+  }
+
+  async function renderSelectedArea() {
+    if (!selectedBounds || renderProgress.active) return;
+    setDrawingArea(false);
+    selectionStartRef.current = null;
+    await renderAreaRef.current(selectedBounds);
   }
 
   function downloadTemplate() {
@@ -1326,14 +1496,18 @@ export function AirspacePlanner() {
       : check.state === "unavailable"
         ? "Clearance not evaluated"
         : "Outside study polygons";
-  const overtureCoverageLabel = coverageStatus === "loading"
+  const overtureCoverageLabel = coverageStatus === "idle"
+    ? "Overture Maps · Awaiting render"
+    : coverageStatus === "loading"
     ? "Overture Maps · Loading coverage"
     : coverageStatus === "error"
       ? "Overture Maps · Coverage unavailable"
       : coverageStatus === "ready"
         ? "Overture Maps · Coverage loaded"
         : "Overture Maps · View too wide";
-  const terrainCoverageLabel = terrainStatus === "loading"
+  const terrainCoverageLabel = terrainStatus === "idle"
+    ? "Surface elevation · Awaiting render"
+    : terrainStatus === "loading"
     ? "Surface elevation · Loading"
     : terrainStatus === "error"
       ? "Surface elevation · Unavailable"
@@ -1343,20 +1517,32 @@ export function AirspacePlanner() {
   const modelDataLabel = !buildingCoverageAvailable
     ? sourceMode === "overture" ? overtureCoverageLabel : "Local buildings · Ready"
     : terrainCoverageLabel;
-  const modelBadge = !buildingCoverageAvailable
-    ? coverageStatus === "loading" ? "LOADING" : coverageStatus === "error" ? "ERROR" : "NARROW VIEW"
-    : terrainStatus === "loading" ? "TERRAIN" : terrainStatus === "error" ? "ERROR" : "NARROW VIEW";
+  const modelBadge = !renderedBounds && !renderProgress.active && coverageStatus === "idle" && terrainStatus === "idle"
+    ? "RENDER"
+    : !buildingCoverageAvailable
+      ? coverageStatus === "loading" ? "LOADING" : coverageStatus === "error" ? "ERROR" : "NARROW AREA"
+      : terrainStatus === "loading" ? "TERRAIN" : terrainStatus === "error" ? "ERROR" : terrainStatus === "idle" ? "RENDER" : "NARROW AREA";
   const unavailableMessage = modelAvailable && selectedSurfaceElevationFt == null
     ? "No decoded surface elevation is available at the selected point, so no clearance conclusion is shown."
+    : !renderedBounds && coverageStatus === "idle" && terrainStatus === "idle"
+      ? "Select an area on the map and press Render. The completed clearance result will remain fixed while you pan or zoom."
     : coverageStatus === "zoom-required"
-    ? `The visible area and its 2,000-ft clearance halo exceed the ${MAX_VISIBLE_OVERTURE_TILES}-tile full-detail budget. Narrow the view to evaluate clearance.`
+    ? `The selected area and its 2,000-ft clearance halo exceed the ${MAX_VISIBLE_OVERTURE_TILES}-tile full-detail budget. Select a smaller area to evaluate clearance.`
     : terrainStatus === "zoom-required"
-      ? `Surface coverage exceeds the ${MAX_VISIBLE_OVERTURE_TILES}-tile elevation budget. Narrow the view to evaluate terrain clearance.`
+      ? `Surface coverage exceeds the ${MAX_VISIBLE_OVERTURE_TILES}-tile elevation budget. Select a smaller area to evaluate terrain clearance.`
       : terrainStatus === "loading"
         ? "Bare-earth surface elevations must load before clearance can be evaluated."
         : terrainStatus === "error"
           ? "Surface elevation coverage is unavailable, so no clearance conclusion is shown."
-          : "Building and surface coverage must load before clearance can be evaluated.";
+          : "Building and surface coverage must finish rendering before clearance can be evaluated.";
+  const selectionIsValid = Boolean(selectedBounds
+    && selectedBounds.east - selectedBounds.west > 0.000001
+    && selectedBounds.north - selectedBounds.south > 0.000001);
+  const selectionLabel = drawingArea
+    ? "Drag across the map to draw a box"
+    : selectedBounds
+      ? renderedBounds ? "New area ready · current result stays until re-render" : "Area selected · ready to render"
+      : "Draw a box or use the current view";
 
   return (
     <main className="app-shell">
@@ -1415,7 +1601,7 @@ export function AirspacePlanner() {
         </aside>
 
         <section className="map-panel" aria-label="Interactive two-dimensional clearance map">
-          <div ref={mapContainerRef} className="map-container" aria-label={`Interactive basemap at ${altitudeFt} feet MSL. Red areas do not meet the modeled clearance. Click to check a point.`} />
+          <div ref={mapContainerRef} className={`map-container ${drawingArea ? "drawing-area" : ""}`} aria-label={`Interactive basemap at ${altitudeFt} feet MSL. Draw a selection box to render a clearance model, or click to check a point in the rendered area.`} />
           {!mapReady && !basemapError && <div className="basemap-loading"><i />Loading basemap…</div>}
           {basemapError && !mapReady && <div className="basemap-loading error">Basemap unavailable. Check your connection.</div>}
           <div className="map-titlebar"><div><span className="location-pin" aria-hidden="true" /><strong>{sourceMode === "overture" ? "Building + surface clearance" : datasetName}</strong><small>{origin.lat.toFixed(4)}° N, {Math.abs(origin.lon).toFixed(4)}° W</small></div><span className="map-mode">2D · MSL</span></div>
@@ -1428,7 +1614,22 @@ export function AirspacePlanner() {
             <button className={basemap === "street" ? "active" : ""} aria-pressed={basemap === "street"} onClick={() => setBasemap("street")}>Street</button>
             <button className={basemap === "sectional" ? "active" : ""} aria-pressed={basemap === "sectional"} title="Sectionals with Terminal Area Charts where available" onClick={() => setBasemap("sectional")}>FAA Charts</button>
           </div>
-          <div className="legend" aria-label="Map legend"><span><i className="legend-red" />Clearance conflict</span><span><i className="legend-amber" />Study polygon</span><span><i className="legend-building" />Building envelope</span></div>
+          <section className="render-toolbar" aria-label="Render area controls">
+            <div className="render-toolbar-copy"><small>RENDER AREA</small><strong>{selectionLabel}</strong></div>
+            <div className="render-actions">
+              <button className={drawingArea ? "active" : ""} aria-pressed={drawingArea} onClick={beginAreaSelection}>{drawingArea ? "Cancel draw" : "Draw area"}</button>
+              <button onClick={useCurrentView} disabled={!mapReady || renderProgress.active}>Use view</button>
+              <button className="render-primary" onClick={renderSelectedArea} disabled={!selectionIsValid || renderProgress.active}>{renderedBounds ? "Re-render" : "Render"}</button>
+            </div>
+            {renderedBounds && !renderProgress.active && <p className="render-persisted"><i />Rendered result is fixed until you press Re-render.</p>}
+            {renderError && <p className="render-error" role="alert">{renderError}</p>}
+          </section>
+          {renderProgress.active && <div className="render-progress" role="status" aria-live="polite">
+            <div className="render-progress-copy"><span><small>RENDERING SELECTED AREA</small><strong>{renderProgress.label}</strong></span><em>{Math.round(renderProgress.value)}%</em></div>
+            <div className="render-progress-track" aria-hidden="true"><i style={{ width: `${Math.max(0, Math.min(100, renderProgress.value))}%` }} /></div>
+            <p>Buildings and terrain are being screened. The completed overlay will stay on the map until you re-render.</p>
+          </div>}
+          <div className="legend" aria-label="Map legend"><span><i className="legend-red" />Clearance conflict</span><span><i className="legend-amber" />Rendered area</span><span><i className="legend-blue" />Selection</span><span><i className="legend-building" />Building</span></div>
           <div className="dataset-card"><span className="dataset-icon" aria-hidden="true">▤</span><span><small>{sourceMode === "overture" ? "AUTOMATIC MODEL LAYERS" : "LOCAL BUILDINGS + TERRAIN"}</small><strong>{datasetName}</strong><em>{dataNote}</em><em>{terrainNote}</em></span>{sourceMode === "local" ? <button onClick={activateOverture}>Use Overture</button> : <span className={`data-live ${modelAvailable ? "" : "paused"}`}>{modelAvailable ? "LIVE" : modelBadge}</span>}</div>
           <div className="basemap-badge">BASEMAP · {basemap === "street" ? "CARTO / OPENSTREETMAP" : "FAA SECTIONAL + TAC"}</div>
         </section>
@@ -1445,14 +1646,14 @@ export function AirspacePlanner() {
           <h2 id="limitations-title">Full envelopes and terrain, with important limits.</h2>
           <p>The aircraft altitude is modeled in feet MSL. Required altitude is the greater of bare-earth surface elevation plus 1,000 feet, or a nearby building’s ground elevation plus its height plus 1,000 feet.</p>
           <p>GeoJSON Polygon and MultiPolygon outer footprints are preserved. The building conflict geometry begins at the closest footprint edge and buffers it by 2,000 feet.</p>
-          <p>When more than 500 obstacles are active in one view, nearby envelopes are conservatively grouped for the red overlay so the altitude control stays responsive. The selected-point check still tests the individual building envelopes.</p>
+          <p>When more than 500 obstacles are active in the rendered area, nearby envelopes are conservatively grouped for the red overlay so the altitude control stays responsive. The selected-point check still tests the individual building envelopes.</p>
           <p>Terrain tiles are divided into 64×64-pixel cells. Each cell uses its highest DEM pixel, so the surface screen is intentionally conservative. DEM elevations are planning data, not surveyed obstacle or navigation values.</p>
-          <p>Building and terrain evaluation use fixed full-detail tiles independent of camera zoom. The loader includes a 2,000-ft halo around the view so edge points can be checked; coverage spanning more than {MAX_VISIBLE_OVERTURE_TILES} tiles is explicitly not evaluated.</p>
-          <p>The FAA evaluates whether an area is “congested” case by case. The visible map extent is treated as a conservative study area—not labeled as an official FAA boundary.</p>
+          <p>Building and terrain evaluation use fixed full-detail tiles independent of camera zoom. Each render includes a 2,000-ft halo around the selected box so edge points can be checked; selections spanning more than {MAX_VISIBLE_OVERTURE_TILES} tiles are explicitly not evaluated.</p>
+          <p>The rendered result remains fixed while you pan or zoom and changes only when you press Re-render. The FAA evaluates whether an area is “congested” case by case, so the selected box is treated as a conservative study area—not labeled as an official FAA boundary.</p>
           <div className="modal-warning"><b>Small UAS note</b><span>Part 107 generally uses a different 400-foot AGL framework and may require airspace authorization. This prototype models the Part 91 rule named above.</span></div>
           <div className="source-detail">
             <h3>Automatic national source: Overture Maps</h3>
-            <p>The map loads Overture’s official global Buildings PMTiles archive for the current release. Polygon/MultiPolygon footprints, building parts, and available height fields feed the clearance model wherever the visible extent and its clearance halo fit within the full-detail tile budget.</p>
+            <p>The map loads Overture’s official global Buildings PMTiles archive for the current release. Polygon/MultiPolygon footprints, building parts, and available height fields feed the clearance model wherever the selected box and its clearance halo fit within the full-detail tile budget.</p>
             <a href="https://docs.overturemaps.org/guides/buildings/" target="_blank" rel="noreferrer">Open Overture Buildings guide ↗</a>
           </div>
           <div className="source-detail">
