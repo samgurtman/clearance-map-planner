@@ -4,6 +4,8 @@ import buffer from "@turf/buffer";
 import intersect from "@turf/intersect";
 import { featureCollection, multiPolygon, point, polygon } from "@turf/helpers";
 import type { Feature, FeatureCollection, MultiPolygon, Polygon } from "geojson";
+import { union as unionPolygons } from "polyclip-ts";
+import type { Geom } from "polyclip-ts";
 import {
   ChangeEvent,
   useEffect,
@@ -591,6 +593,20 @@ function groupDenseBuildings(buildings: Building[], cellSize = 750): Building[] 
 
 const emptyFeatures = (): FeatureCollection => featureCollection([]);
 
+function dissolveConflictFeatures(features: Array<Feature<Polygon | MultiPolygon>>): FeatureCollection<Polygon | MultiPolygon> {
+  if (features.length < 2) return featureCollection(features);
+  try {
+    const geometries = features.map((feature) => feature.geometry.coordinates as Geom);
+    const coordinates = unionPolygons(geometries[0], ...geometries.slice(1));
+    return coordinates.length
+      ? featureCollection([multiPolygon(coordinates, { dissolved: true })])
+      : featureCollection([]);
+  } catch (error) {
+    console.error("Conflict geometry dissolve failed", error);
+    return featureCollection(features);
+  }
+}
+
 function ringsFromOvertureFeature(feature: Feature<Polygon | MultiPolygon>): number[][][] {
   if (feature.geometry.type === "Polygon") return [(feature.geometry.coordinates as number[][][])[0]];
   if (feature.geometry.type === "MultiPolygon") return (feature.geometry.coordinates as number[][][][]).map((candidate) => candidate[0]);
@@ -898,7 +914,7 @@ export function AirspacePlanner() {
         }
       });
     });
-    return featureCollection(features);
+    return dissolveConflictFeatures(features);
   }, [modelAvailable, altitudeFt, modeledBuildings, terrainCells, renderedBounds, zones, origin]);
 
   useEffect(() => {
@@ -1596,7 +1612,7 @@ export function AirspacePlanner() {
 
           <div className="panel-footer">
             <button onClick={() => setDetailsOpen((current) => !current)}>{detailsOpen ? "Hide" : "Show"} model details <span>{detailsOpen ? "−" : "+"}</span></button>
-            {detailsOpen && <div className="model-details"><p>Red geometry combines conservative surface-elevation cells with a true 2,000-ft buffer around each active building footprint.</p><p>Airspace, temporary restrictions, weather, routes, takeoff/landing exceptions, and §91.119(a)/(c)/(d) are not modeled.</p></div>}
+            {detailsOpen && <div className="model-details"><p>Red geometry combines conservative surface-elevation cells with a true 2,000-ft buffer around each active building footprint. Overlapping conflicts are dissolved into one layer, so the red shade stays uniform.</p><p>Airspace, temporary restrictions, weather, routes, takeoff/landing exceptions, and §91.119(a)/(c)/(d) are not modeled.</p></div>}
           </div>
         </aside>
 
