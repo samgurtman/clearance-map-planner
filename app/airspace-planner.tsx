@@ -48,7 +48,7 @@ const OVERTURE_MEMORY_CACHE_MAX_TILES = 48;
 const OVERTURE_MEMORY_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 const OVERTURE_PERSISTENT_CACHE_MAX_TILES = 256;
 const OVERTURE_PERSISTENT_CACHE_MAX_BYTES = 256 * 1024 * 1024;
-const MAX_VISIBLE_OVERTURE_TILES = 64;
+const MAX_VISIBLE_OVERTURE_TILES = 128;
 const CLEARANCE_DISTANCE_FT = 2000;
 const FEET_PER_LAT_DEGREE = 364_000;
 const feetPerLonDegree = (latitude: number) => 364_000 * Math.cos((latitude * Math.PI) / 180);
@@ -682,12 +682,20 @@ export function AirspacePlanner() {
           viewportBounds.getEast(),
           viewportBounds.getNorth(),
         ].map((value) => value.toFixed(6)).join(":");
+        const clearanceLatPadding = CLEARANCE_DISTANCE_FT / FEET_PER_LAT_DEGREE;
+        const clearanceLonPadding = CLEARANCE_DISTANCE_FT / Math.max(1, feetPerLonDegree(center.lat));
+        const requiredCoverage = {
+          west: viewportBounds.getWest() - clearanceLonPadding,
+          east: viewportBounds.getEast() + clearanceLonPadding,
+          south: viewportBounds.getSouth() - clearanceLatPadding,
+          north: viewportBounds.getNorth() + clearanceLatPadding,
+        };
         const previousCoverage = coverageBoundsRef.current;
         const viewportAlreadyCovered = Boolean(previousCoverage
-          && viewportBounds.getWest() >= previousCoverage.west
-          && viewportBounds.getEast() <= previousCoverage.east
-          && viewportBounds.getSouth() >= previousCoverage.south
-          && viewportBounds.getNorth() <= previousCoverage.north);
+          && requiredCoverage.west >= previousCoverage.west
+          && requiredCoverage.east <= previousCoverage.east
+          && requiredCoverage.south >= previousCoverage.south
+          && requiredCoverage.north <= previousCoverage.north);
         const clearCoverage = () => {
           loadSerial += 1;
           coverageBoundsRef.current = null;
@@ -699,14 +707,25 @@ export function AirspacePlanner() {
           setBuildings([]);
           setZones([viewportStudyZone(map, nextOrigin)]);
         };
+        if (viewportAlreadyCovered && loadedTileKeyRef.current) {
+          const cancelledRefresh = Boolean(pendingTileKeyRef.current);
+          if (cancelledRefresh) {
+            loadSerial += 1;
+            pendingTileKeyRef.current = null;
+          }
+          const stableOrigin = liveDataRef.current.origin;
+          setZones([viewportStudyZone(map, stableOrigin)]);
+          loadedViewportKeyRef.current = viewportKey;
+          setCoverageStatus("ready");
+          if (cancelledRefresh) setDataNote("Using already-loaded full-detail coverage · no tile reload needed");
+          return;
+        }
         const zoom = fullTileZoom;
         const maxTile = (2 ** zoom) - 1;
-        const clearanceLatPadding = CLEARANCE_DISTANCE_FT / FEET_PER_LAT_DEGREE;
-        const clearanceLonPadding = CLEARANCE_DISTANCE_FT / Math.max(1, feetPerLonDegree(center.lat));
-        const minX = Math.max(0, Math.min(maxTile, tileX(viewportBounds.getWest() - clearanceLonPadding, zoom)));
-        const maxX = Math.max(0, Math.min(maxTile, tileX(viewportBounds.getEast() + clearanceLonPadding, zoom)));
-        const minY = Math.max(0, Math.min(maxTile, tileY(viewportBounds.getNorth() + clearanceLatPadding, zoom)));
-        const maxY = Math.max(0, Math.min(maxTile, tileY(viewportBounds.getSouth() - clearanceLatPadding, zoom)));
+        const minX = Math.max(0, Math.min(maxTile, tileX(requiredCoverage.west, zoom)));
+        const maxX = Math.max(0, Math.min(maxTile, tileX(requiredCoverage.east, zoom)));
+        const minY = Math.max(0, Math.min(maxTile, tileY(requiredCoverage.north, zoom)));
+        const maxY = Math.max(0, Math.min(maxTile, tileY(requiredCoverage.south, zoom)));
         const visibleTileCount = (maxX - minX + 1) * (maxY - minY + 1);
         if (visibleTileCount <= 0 || visibleTileCount > MAX_VISIBLE_OVERTURE_TILES) {
           clearCoverage();
@@ -724,10 +743,10 @@ export function AirspacePlanner() {
             const stableOrigin = liveDataRef.current.origin;
             setZones([viewportStudyZone(map, stableOrigin)]);
             coverageBoundsRef.current = {
-              west: viewportBounds.getWest(),
-              east: viewportBounds.getEast(),
-              south: viewportBounds.getSouth(),
-              north: viewportBounds.getNorth(),
+              west: Math.min(previousCoverage?.west ?? requiredCoverage.west, requiredCoverage.west),
+              east: Math.max(previousCoverage?.east ?? requiredCoverage.east, requiredCoverage.east),
+              south: Math.min(previousCoverage?.south ?? requiredCoverage.south, requiredCoverage.south),
+              north: Math.max(previousCoverage?.north ?? requiredCoverage.north, requiredCoverage.north),
             };
             loadedViewportKeyRef.current = viewportKey;
           }
@@ -793,12 +812,7 @@ export function AirspacePlanner() {
           loadedTileKeyRef.current = tileKey;
           loadedViewportKeyRef.current = viewportKey;
           pendingTileKeyRef.current = null;
-          coverageBoundsRef.current = {
-            west: viewportBounds.getWest(),
-            east: viewportBounds.getEast(),
-            south: viewportBounds.getSouth(),
-            north: viewportBounds.getNorth(),
-          };
+          coverageBoundsRef.current = requiredCoverage;
           setCoverageStatus("ready");
           setDatasetName(`Overture Maps · ${release}`);
           setDataNote(`${nextBuildings.length.toLocaleString()} visible envelopes · ${measured.toLocaleString()} with height/floor data · ${coordinates.length} full-detail z${zoom} tile${coordinates.length === 1 ? "" : "s"}`);
