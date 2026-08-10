@@ -22,18 +22,36 @@ type Building = Point & {
   envelopes: Point[][];
   heightFt: number;
   heightSource: string;
+  groundElevationFt?: number;
 };
 type Zone = { id: string; label: string; points: Point[]; source: string };
+type TerrainCell = {
+  id: string;
+  zoom: number;
+  tileX: number;
+  tileY: number;
+  cellX: number;
+  cellY: number;
+  west: number;
+  east: number;
+  south: number;
+  north: number;
+  elevationFt: number;
+};
 type Check = {
   state: "conflict" | "clear" | "outside" | "unavailable";
   zone?: Zone;
   obstacle?: Building;
+  controllingSource?: "surface" | "building";
+  surfaceElevationFt?: number;
+  obstacleTopElevationFt?: number;
   requiredFt?: number;
   marginFt?: number;
   envelopeDistanceFt?: number;
 };
 type ImportedDataset = { buildings: Building[]; origin: Origin; note: string };
 type CoverageStatus = "loading" | "ready" | "zoom-required" | "error";
+type TerrainStatus = "loading" | "ready" | "zoom-required" | "error";
 type Basemap = "street" | "sectional";
 
 const CHICAGO_ORIGIN: Origin = { lat: 41.8819, lon: -87.6324 };
@@ -41,6 +59,11 @@ const OVERTURE_FALLBACK_RELEASE = "2026-07-22.0";
 const OVERTURE_CATALOG_URL = "https://stac.overturemaps.org/catalog.json";
 const FAA_SECTIONAL_TILE_URL = "https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer/tile/{z}/{y}/{x}";
 const FAA_TERMINAL_TILE_URL = "https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Terminal/MapServer/tile/{z}/{y}/{x}";
+const TERRAIN_TILE_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
+const TERRAIN_TILE_ZOOM = 14;
+const TERRAIN_CELL_DIVISIONS = 4;
+const TERRAIN_MEMORY_CACHE_MAX_TILES = 192;
+const TERRAIN_FETCH_CONCURRENCY = 8;
 const OVERTURE_TILE_CACHE_DB = "clearance-overture-tile-cache-v1";
 const OVERTURE_TILE_CACHE_STORE = "tiles";
 const OVERTURE_TILE_CACHE_META_STORE = "metadata";
@@ -54,11 +77,78 @@ const FEET_PER_LAT_DEGREE = 364_000;
 const feetPerLonDegree = (latitude: number) => 364_000 * Math.cos((latitude * Math.PI) / 180);
 
 type OvertureTileCacheMetadata = { key: string; byteLength: number; lastUsed: number };
+type TerrainRaster = { width: number; height: number; data: Uint8ClampedArray };
 
 const overtureMemoryTileCache = new Map<string, ArrayBuffer>();
 const overtureTileRequests = new Map<string, Promise<ArrayBuffer | null>>();
+const terrainMemoryTileCache = new Map<string, TerrainRaster>();
+const terrainTileRequests = new Map<string, Promise<TerrainRaster | null>>();
 let overtureMemoryTileCacheBytes = 0;
 let overtureTileCacheDatabase: Promise<IDBDatabase | null> | null = null;
+
+function rememberTerrainTile(key: string, raster: TerrainRaster) {
+  terrainMemoryTileCache.delete(key);
+  terrainMemoryTileCache.set(key, raster);
+  while (terrainMemoryTileCache.size > TERRAIN_MEMORY_CACHE_MAX_TILES) {
+    const oldestKey = terrainMemoryTileCache.keys().next().value as string | undefined;
+    if (!oldestKey) break;
+    terrainMemoryTileCache.delete(oldestKey);
+  }
+}
+
+async function decodeTerrainRaster(data: ArrayBuffer): Promise<TerrainRaster> {
+  const bitmap = await createImageBitmap(new Blob([data], { type: "image/png" }));
+  const canvas = document.createElement("canvas");
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) {
+    bitmap.close();
+    throw new Error("Terrain image decoding is unavailable.");
+  }
+  context.drawImage(bitmap, 0, 0);
+  const pixels = context.getImageData(0, 0, bitmap.width, bitmap.height);
+  bitmap.close();
+  return { width: pixels.width, height: pixels.height, data: pixels.data };
+}
+
+async function loadTerrainTile(zoom: number, x: number, y: number) {
+  const key = `${zoom}/${x}/${y}`;
+  const cached = terrainMemoryTileCache.get(key);
+  if (cached) {
+    rememberTerrainTile(key, cached);
+    return cached;
+  }
+  const pending = terrainTileRequests.get(key);
+  if (pending) return pending;
+  const request = (async () => {
+    const response = await fetch(TERRAIN_TILE_URL.replace("{z}", String(zoom)).replace("{x}", String(x)).replace("{y}", String(y)));
+    if (!response.ok) return null;
+    const raster = await decodeTerrainRaster(await response.arrayBuffer());
+    rememberTerrainTile(key, raster);
+    return raster;
+  })();
+  terrainTileRequests.set(key, request);
+  try {
+    return await request;
+  } finally {
+    if (terrainTileRequests.get(key) === request) terrainTileRequests.delete(key);
+  }
+}
+
+async function mapWithConcurrency<T, R>(items: T[], concurrency: number, mapper: (item: T) => Promise<R>) {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await mapper(items[index]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
 
 function readMemoryTile(key: string) {
   const data = overtureMemoryTileCache.get(key);
@@ -280,20 +370,34 @@ function distanceToBuilding(value: Point, building: Building) {
   return Math.min(...building.envelopes.map((envelope) => distanceToEnvelope(value, envelope)));
 }
 
-function evaluatePoint(value: Point, altitudeFt: number, buildings: Building[], zones: Zone[]): Check {
+function buildingTopElevationFt(building: Building) {
+  return building.groundElevationFt == null ? null : building.groundElevationFt + building.heightFt;
+}
+
+function evaluatePoint(value: Point, altitudeFt: number, buildings: Building[], zones: Zone[], surfaceElevationFt: number | null): Check {
   const zone = zones.find((candidate) => pointInPolygon(value, candidate.points));
   if (!zone) return { state: "outside" };
+  if (surfaceElevationFt == null) return { state: "unavailable", zone };
   let highest: { building: Building; distance: number } | undefined;
   for (const building of buildings) {
+    const topElevationFt = buildingTopElevationFt(building);
+    if (topElevationFt == null) continue;
     const distance = distanceToBuilding(value, building);
-    if (distance <= 2000 && (!highest || building.heightFt > highest.building.heightFt)) highest = { building, distance };
+    if (distance <= CLEARANCE_DISTANCE_FT && (!highest || topElevationFt > (buildingTopElevationFt(highest.building) ?? -Infinity))) highest = { building, distance };
   }
-  const requiredFt = Math.max(1000, (highest?.building.heightFt ?? 0) + 1000);
+  const surfaceRequiredFt = surfaceElevationFt + 1000;
+  const obstacleTopElevationFt = highest ? buildingTopElevationFt(highest.building) ?? undefined : undefined;
+  const buildingRequiredFt = obstacleTopElevationFt == null ? -Infinity : obstacleTopElevationFt + 1000;
+  const controllingSource = buildingRequiredFt > surfaceRequiredFt ? "building" : "surface";
+  const requiredFt = Math.ceil(Math.max(surfaceRequiredFt, buildingRequiredFt));
   const marginFt = altitudeFt - requiredFt;
   return {
     state: marginFt >= 0 ? "clear" : "conflict",
     zone,
     obstacle: highest?.building,
+    controllingSource,
+    surfaceElevationFt,
+    obstacleTopElevationFt,
     requiredFt,
     marginFt,
     envelopeDistanceFt: highest?.distance,
@@ -308,7 +412,7 @@ function closedCoordinates(points: Point[], origin: Origin) {
 }
 
 function buildingFeature(building: Building, origin: Origin): Feature<Polygon | MultiPolygon> {
-  const properties = { id: building.id, name: building.name, heightFt: building.heightFt, heightSource: building.heightSource };
+  const properties = { id: building.id, name: building.name, heightFt: building.heightFt, groundElevationFt: building.groundElevationFt, topElevationFt: buildingTopElevationFt(building), heightSource: building.heightSource };
   if (building.envelopes.length > 1) {
     return multiPolygon(building.envelopes.map((envelope) => [closedCoordinates(envelope, origin)]), properties);
   }
@@ -428,39 +532,49 @@ function parseGeoJson(text: string): ImportedDataset {
   return { buildings, origin, note: "GeoJSON envelopes preserved · Overture height fields supported" };
 }
 
-function estimateFlaggedSquareMiles(altitudeFt: number, buildings: Building[], zones: Zone[]) {
+function estimateFlaggedSquareMiles(altitudeFt: number, buildings: Building[], zones: Zone[], origin: Origin, terrainIndex: Map<string, TerrainCell>) {
   if (!zones.length) return 0;
   const xs = zones.flatMap((zone) => zone.points.map((value) => value.x));
   const ys = zones.flatMap((zone) => zone.points.map((value) => value.y));
   const width = Math.max(...xs) - Math.min(...xs);
   const depth = Math.max(...ys) - Math.min(...ys);
   const step = Math.max(300, Math.sqrt((width * depth) / 2500));
-  const active = buildings.filter((building) => altitudeFt < building.heightFt + 1000);
+  const active = buildings.filter((building) => {
+    const topElevationFt = buildingTopElevationFt(building);
+    return topElevationFt != null && altitudeFt < topElevationFt + 1000;
+  });
   const screened = active.length > 500 ? groupDenseBuildings(active) : active;
   let flagged = 0;
   for (let x = Math.min(...xs); x <= Math.max(...xs); x += step) {
     for (let y = Math.min(...ys); y <= Math.max(...ys); y += step) {
       const sample = { x, y };
       if (!zones.some((zone) => pointInPolygon(sample, zone.points))) continue;
-      if (altitudeFt < 1000 || screened.some((building) => distanceToBuilding(sample, building) <= 2000)) flagged += 1;
+      const [lon, lat] = localToLngLat(sample, origin);
+      const surfaceElevationFt = terrainElevationAtLngLat(lon, lat, terrainIndex);
+      if ((surfaceElevationFt != null && altitudeFt < surfaceElevationFt + 1000) || screened.some((building) => distanceToBuilding(sample, building) <= CLEARANCE_DISTANCE_FT)) flagged += 1;
     }
   }
   return (flagged * step * step) / 27_878_400;
 }
 
 function groupDenseBuildings(buildings: Building[], cellSize = 750): Building[] {
-  const groups = new Map<string, { minX: number; minY: number; maxX: number; maxY: number; heightFt: number; count: number }>();
+  const groups = new Map<string, { minX: number; minY: number; maxX: number; maxY: number; heightFt: number; groundElevationFt?: number; topElevationFt: number; count: number }>();
   buildings.forEach((building) => {
     const key = `${Math.floor(building.x / cellSize)}:${Math.floor(building.y / cellSize)}`;
     const points = building.envelopes.flat();
-    const current = groups.get(key) || { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity, heightFt: 0, count: 0 };
+    const current = groups.get(key) || { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity, heightFt: 0, topElevationFt: -Infinity, count: 0 };
     points.forEach((value) => {
       current.minX = Math.min(current.minX, value.x);
       current.minY = Math.min(current.minY, value.y);
       current.maxX = Math.max(current.maxX, value.x);
       current.maxY = Math.max(current.maxY, value.y);
     });
-    current.heightFt = Math.max(current.heightFt, building.heightFt);
+    const topElevationFt = buildingTopElevationFt(building);
+    if (topElevationFt != null && topElevationFt > current.topElevationFt) {
+      current.topElevationFt = topElevationFt;
+      current.heightFt = building.heightFt;
+      current.groundElevationFt = building.groundElevationFt;
+    }
     current.count += 1;
     groups.set(key, current);
   });
@@ -469,7 +583,7 @@ function groupDenseBuildings(buildings: Building[], cellSize = 750): Building[] 
     const depth = Math.max(20, group.maxY - group.minY);
     const x = (group.minX + group.maxX) / 2;
     const y = (group.minY + group.maxY) / 2;
-    return { id: `group-${key}`, name: `${group.count} nearby envelopes`, x, y, envelopes: [rectangleEnvelope(x, y, width, depth)], heightFt: group.heightFt, heightSource: "Dense-view group" };
+    return { id: `group-${key}`, name: `${group.count} nearby envelopes`, x, y, envelopes: [rectangleEnvelope(x, y, width, depth)], heightFt: group.heightFt, groundElevationFt: group.groundElevationFt, heightSource: "Dense-view group" };
   });
 }
 
@@ -523,6 +637,104 @@ function tileY(lat: number, zoom: number) {
   return Math.floor(((1 - Math.asinh(Math.tan(radians)) / Math.PI) / 2) * (2 ** zoom));
 }
 
+function tileXPosition(lon: number, zoom: number) {
+  return ((lon + 180) / 360) * (2 ** zoom);
+}
+
+function tileYPosition(lat: number, zoom: number) {
+  const radians = Math.max(-85.05112878, Math.min(85.05112878, lat)) * Math.PI / 180;
+  return ((1 - Math.asinh(Math.tan(radians)) / Math.PI) / 2) * (2 ** zoom);
+}
+
+function longitudeAtTilePosition(position: number, zoom: number) {
+  return (position / (2 ** zoom)) * 360 - 180;
+}
+
+function latitudeAtTilePosition(position: number, zoom: number) {
+  return Math.atan(Math.sinh(Math.PI * (1 - (2 * position) / (2 ** zoom)))) * 180 / Math.PI;
+}
+
+function terrainCellId(zoom: number, tileColumn: number, tileRow: number, cellColumn: number, cellRow: number) {
+  return `${zoom}/${tileColumn}/${tileRow}/${cellColumn}/${cellRow}`;
+}
+
+async function terrainCellsFromTiles(tiles: Array<{ x: number; y: number; raster: TerrainRaster }>, zoom: number) {
+  const cells: TerrainCell[] = [];
+  for (const { x, y, raster } of tiles) {
+    const maxima = new Array<number>(TERRAIN_CELL_DIVISIONS * TERRAIN_CELL_DIVISIONS).fill(-Infinity);
+    for (let pixelY = 0; pixelY < raster.height; pixelY += 1) {
+      const cellY = Math.min(TERRAIN_CELL_DIVISIONS - 1, Math.floor((pixelY / raster.height) * TERRAIN_CELL_DIVISIONS));
+      for (let pixelX = 0; pixelX < raster.width; pixelX += 1) {
+        const offset = (pixelY * raster.width + pixelX) * 4;
+        if (raster.data[offset + 3] === 0) continue;
+        const elevationMeters = (raster.data[offset] * 256 + raster.data[offset + 1] + raster.data[offset + 2] / 256) - 32768;
+        const cellX = Math.min(TERRAIN_CELL_DIVISIONS - 1, Math.floor((pixelX / raster.width) * TERRAIN_CELL_DIVISIONS));
+        const cellIndex = cellY * TERRAIN_CELL_DIVISIONS + cellX;
+        maxima[cellIndex] = Math.max(maxima[cellIndex], elevationMeters);
+      }
+    }
+    for (let cellY = 0; cellY < TERRAIN_CELL_DIVISIONS; cellY += 1) {
+      for (let cellX = 0; cellX < TERRAIN_CELL_DIVISIONS; cellX += 1) {
+        const elevationMeters = maxima[cellY * TERRAIN_CELL_DIVISIONS + cellX];
+        if (!Number.isFinite(elevationMeters)) continue;
+        const west = longitudeAtTilePosition(x + cellX / TERRAIN_CELL_DIVISIONS, zoom);
+        const east = longitudeAtTilePosition(x + (cellX + 1) / TERRAIN_CELL_DIVISIONS, zoom);
+        const north = latitudeAtTilePosition(y + cellY / TERRAIN_CELL_DIVISIONS, zoom);
+        const south = latitudeAtTilePosition(y + (cellY + 1) / TERRAIN_CELL_DIVISIONS, zoom);
+        cells.push({
+          id: terrainCellId(zoom, x, y, cellX, cellY),
+          zoom,
+          tileX: x,
+          tileY: y,
+          cellX,
+          cellY,
+          west,
+          east,
+          south,
+          north,
+          elevationFt: Math.ceil(elevationMeters * 3.28084),
+        });
+      }
+    }
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  }
+  return cells;
+}
+
+function terrainElevationAtLngLat(lon: number, lat: number, terrainIndex: Map<string, TerrainCell>) {
+  const xPosition = tileXPosition(lon, TERRAIN_TILE_ZOOM);
+  const yPosition = tileYPosition(lat, TERRAIN_TILE_ZOOM);
+  const tileColumn = Math.floor(xPosition);
+  const tileRow = Math.floor(yPosition);
+  const cellColumn = Math.max(0, Math.min(TERRAIN_CELL_DIVISIONS - 1, Math.floor((xPosition - tileColumn) * TERRAIN_CELL_DIVISIONS)));
+  const cellRow = Math.max(0, Math.min(TERRAIN_CELL_DIVISIONS - 1, Math.floor((yPosition - tileRow) * TERRAIN_CELL_DIVISIONS)));
+  return terrainIndex.get(terrainCellId(TERRAIN_TILE_ZOOM, tileColumn, tileRow, cellColumn, cellRow))?.elevationFt ?? null;
+}
+
+function addGroundElevations(buildings: Building[], origin: Origin, terrainIndex: Map<string, TerrainCell>) {
+  return buildings.map((building) => {
+    const samples: Point[] = [{ x: building.x, y: building.y }];
+    building.envelopes.forEach((envelope) => {
+      const stride = Math.max(1, Math.ceil(envelope.length / 16));
+      for (let index = 0; index < envelope.length; index += stride) samples.push(envelope[index]);
+    });
+    const elevations = samples.flatMap((sample) => {
+      const [lon, lat] = localToLngLat(sample, origin);
+      const elevationFt = terrainElevationAtLngLat(lon, lat, terrainIndex);
+      return elevationFt == null ? [] : [elevationFt];
+    });
+    return { ...building, groundElevationFt: elevations.length ? Math.max(...elevations) : undefined };
+  });
+}
+
+function terrainCellFeature(cell: TerrainCell) {
+  return polygon([[ [cell.west, cell.north], [cell.east, cell.north], [cell.east, cell.south], [cell.west, cell.south], [cell.west, cell.north] ]], {
+    surfaceElevationFt: cell.elevationFt,
+    requiredFt: cell.elevationFt + 1000,
+    source: "Mapzen Terrain Tiles / USGS 3DEP",
+  });
+}
+
 function viewportStudyZone(map: MapLibreMap, origin: Origin): Zone {
   const bounds = map.getBounds();
   const west = bounds.getWest();
@@ -547,10 +759,14 @@ export function AirspacePlanner() {
   const mapRef = useRef<MapLibreMap | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const overtureReloadRef = useRef<() => void>(() => {});
+  const terrainReloadRef = useRef<() => void>(() => {});
   const coverageBoundsRef = useRef<{ west: number; east: number; south: number; north: number } | null>(null);
+  const terrainCoverageBoundsRef = useRef<{ west: number; east: number; south: number; north: number } | null>(null);
   const loadedTileKeyRef = useRef<string | null>(null);
   const loadedViewportKeyRef = useRef<string | null>(null);
   const pendingTileKeyRef = useRef<string | null>(null);
+  const loadedTerrainTileKeyRef = useRef<string | null>(null);
+  const pendingTerrainTileKeyRef = useRef<string | null>(null);
   const liveDataRef = useRef({ altitudeFt: 1800, buildings: [] as Building[], zones: [] as Zone[], origin: CHICAGO_ORIGIN, sourceMode: "overture" as "overture" | "local" });
   const [altitudeFt, setAltitudeFt] = useState(1800);
   const [buildings, setBuildings] = useState<Building[]>([]);
@@ -559,6 +775,9 @@ export function AirspacePlanner() {
   const [datasetName, setDatasetName] = useState("Overture Maps · automatic");
   const [dataNote, setDataNote] = useState("Loading visible building tiles…");
   const [coverageStatus, setCoverageStatus] = useState<CoverageStatus>("loading");
+  const [terrainCells, setTerrainCells] = useState<TerrainCell[]>([]);
+  const [terrainStatus, setTerrainStatus] = useState<TerrainStatus>("loading");
+  const [terrainNote, setTerrainNote] = useState("Loading bare-earth elevation tiles…");
   const [sourceMode, setSourceMode] = useState<"overture" | "local">("overture");
   const [overtureRelease, setOvertureRelease] = useState(OVERTURE_FALLBACK_RELEASE);
   const [selectedLngLat, setSelectedLngLat] = useState<[number, number]>(localToLngLat({ x: 80, y: 160 }, CHICAGO_ORIGIN));
@@ -574,43 +793,57 @@ export function AirspacePlanner() {
   }, [altitudeFt, buildings, zones, origin, sourceMode]);
 
   const selected = useMemo(() => lngLatToLocal(selectedLngLat[0], selectedLngLat[1], origin), [selectedLngLat, origin]);
-  const modelAvailable = sourceMode === "local" || coverageStatus === "ready";
+  const terrainIndex = useMemo(() => new Map(terrainCells.map((cell) => [cell.id, cell])), [terrainCells]);
+  const modeledBuildings = useMemo(() => addGroundElevations(buildings, origin, terrainIndex), [buildings, origin, terrainIndex]);
+  const selectedSurfaceElevationFt = useMemo(() => terrainElevationAtLngLat(selectedLngLat[0], selectedLngLat[1], terrainIndex), [selectedLngLat, terrainIndex]);
+  const buildingCoverageAvailable = sourceMode === "local" || coverageStatus === "ready";
+  const modelAvailable = buildingCoverageAvailable && terrainStatus === "ready";
   const check = useMemo<Check>(
-    () => modelAvailable ? evaluatePoint(selected, altitudeFt, buildings, zones) : { state: "unavailable" },
-    [modelAvailable, selected, altitudeFt, buildings, zones],
+    () => modelAvailable ? evaluatePoint(selected, altitudeFt, modeledBuildings, zones, selectedSurfaceElevationFt) : { state: "unavailable" },
+    [modelAvailable, selected, altitudeFt, modeledBuildings, zones, selectedSurfaceElevationFt],
   );
-  const activeObstacles = useMemo(() => buildings.filter((building) => altitudeFt < building.heightFt + 1000).length, [altitudeFt, buildings]);
-  const flaggedSquareMiles = useMemo(() => estimateFlaggedSquareMiles(altitudeFt, buildings, zones), [altitudeFt, buildings, zones]);
+  const activeObstacles = useMemo(() => modeledBuildings.filter((building) => {
+    const topElevationFt = buildingTopElevationFt(building);
+    return topElevationFt != null && altitudeFt < topElevationFt + 1000;
+  }).length, [altitudeFt, modeledBuildings]);
+  const flaggedSquareMiles = useMemo(() => estimateFlaggedSquareMiles(altitudeFt, modeledBuildings, zones, origin, terrainIndex), [altitudeFt, modeledBuildings, zones, origin, terrainIndex]);
   const buildingsGeoJson = useMemo(
-    () => sourceMode === "local" ? featureCollection(buildings.map((building) => buildingFeature(building, origin))) : emptyFeatures(),
-    [buildings, origin, sourceMode],
+    () => sourceMode === "local" ? featureCollection(modeledBuildings.map((building) => buildingFeature(building, origin))) : emptyFeatures(),
+    [modeledBuildings, origin, sourceMode],
   );
   const zonesGeoJson = useMemo(() => featureCollection(zones.map((zone) => zoneFeature(zone, origin))), [zones, origin]);
   const selectedGeoJson = useMemo(() => featureCollection([point(localToLngLat(selected, origin), { state: check.state })]), [selected, origin, check.state]);
   const conflictsGeoJson = useMemo(() => {
     if (!modelAvailable) return emptyFeatures();
-    if (altitudeFt < 1000) return featureCollection(zones.map((zone) => zoneFeature(zone, origin)));
     const features: Array<Feature<Polygon | MultiPolygon>> = [];
-    const active = buildings.filter((building) => altitudeFt < building.heightFt + 1000);
+    terrainCells.forEach((cell) => {
+      if (altitudeFt < cell.elevationFt + 1000) features.push(terrainCellFeature(cell));
+    });
+    const active = modeledBuildings.filter((building) => {
+      const topElevationFt = buildingTopElevationFt(building);
+      return topElevationFt != null && altitudeFt < topElevationFt + 1000;
+    });
     const displayBuildings = active.length > 500 ? groupDenseBuildings(active) : active;
     displayBuildings.forEach((building) => {
-      const expanded = buffer(buildingFeature(building, origin), 2000, { units: "feet", steps: 12 });
+      const expanded = buffer(buildingFeature(building, origin), CLEARANCE_DISTANCE_FT, { units: "feet", steps: 12 });
       if (!expanded) return;
       zones.forEach((zone) => {
         const clipped = intersect(featureCollection([expanded, zoneFeature(zone, origin)]));
         if (clipped) {
-          clipped.properties = { building: building.name, heightFt: building.heightFt, requiredFt: building.heightFt + 1000 };
+          const topElevationFt = buildingTopElevationFt(building);
+          clipped.properties = { building: building.name, heightFt: building.heightFt, groundElevationFt: building.groundElevationFt, topElevationFt, requiredFt: topElevationFt == null ? null : topElevationFt + 1000 };
           features.push(clipped);
         }
       });
     });
     return featureCollection(features);
-  }, [modelAvailable, altitudeFt, buildings, zones, origin]);
+  }, [modelAvailable, altitudeFt, modeledBuildings, terrainCells, zones, origin]);
 
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) return;
     let disposed = false;
     let loadSerial = 0;
+    let terrainLoadSerial = 0;
     Promise.all([
       import("maplibre-gl"),
       import("pmtiles"),
@@ -666,9 +899,102 @@ export function AirspacePlanner() {
         maxZoom: 24,
         pitch: 0,
         bearing: 0,
-        attributionControl: {},
+        attributionControl: { customAttribution: '<a href="https://registry.opendata.aws/terrain-tiles/" target="_blank">Terrain © Mapzen · USGS 3DEP</a>' },
       });
       mapRef.current = map;
+
+      const loadVisibleTerrainTiles = async () => {
+        const center = map.getCenter();
+        const viewportBounds = map.getBounds();
+        const clearanceLatPadding = CLEARANCE_DISTANCE_FT / FEET_PER_LAT_DEGREE;
+        const clearanceLonPadding = CLEARANCE_DISTANCE_FT / Math.max(1, feetPerLonDegree(center.lat));
+        const requiredCoverage = {
+          west: viewportBounds.getWest() - clearanceLonPadding,
+          east: viewportBounds.getEast() + clearanceLonPadding,
+          south: viewportBounds.getSouth() - clearanceLatPadding,
+          north: viewportBounds.getNorth() + clearanceLatPadding,
+        };
+        const previousCoverage = terrainCoverageBoundsRef.current;
+        const alreadyCovered = Boolean(previousCoverage
+          && requiredCoverage.west >= previousCoverage.west
+          && requiredCoverage.east <= previousCoverage.east
+          && requiredCoverage.south >= previousCoverage.south
+          && requiredCoverage.north <= previousCoverage.north);
+        const clearTerrain = () => {
+          terrainLoadSerial += 1;
+          terrainCoverageBoundsRef.current = null;
+          loadedTerrainTileKeyRef.current = null;
+          pendingTerrainTileKeyRef.current = null;
+          setTerrainCells([]);
+        };
+        if (alreadyCovered && loadedTerrainTileKeyRef.current) {
+          if (pendingTerrainTileKeyRef.current) {
+            terrainLoadSerial += 1;
+            pendingTerrainTileKeyRef.current = null;
+            setTerrainNote("Using already-loaded bare-earth elevation coverage");
+          }
+          setTerrainStatus("ready");
+          return;
+        }
+        const maxTile = (2 ** TERRAIN_TILE_ZOOM) - 1;
+        const minX = Math.max(0, Math.min(maxTile, tileX(requiredCoverage.west, TERRAIN_TILE_ZOOM)));
+        const maxX = Math.max(0, Math.min(maxTile, tileX(requiredCoverage.east, TERRAIN_TILE_ZOOM)));
+        const minY = Math.max(0, Math.min(maxTile, tileY(requiredCoverage.north, TERRAIN_TILE_ZOOM)));
+        const maxY = Math.max(0, Math.min(maxTile, tileY(requiredCoverage.south, TERRAIN_TILE_ZOOM)));
+        const visibleTileCount = (maxX - minX + 1) * (maxY - minY + 1);
+        if (visibleTileCount <= 0 || visibleTileCount > MAX_VISIBLE_OVERTURE_TILES) {
+          clearTerrain();
+          setTerrainStatus("zoom-required");
+          setTerrainNote(`Surface coverage spans ${visibleTileCount.toLocaleString()} elevation tiles · narrow the view to ${MAX_VISIBLE_OVERTURE_TILES} or fewer`);
+          return;
+        }
+        const coordinates: Array<{ x: number; y: number }> = [];
+        for (let x = minX; x <= maxX; x += 1) {
+          for (let y = minY; y <= maxY; y += 1) coordinates.push({ x, y });
+        }
+        const tileKey = coordinates.map(({ x, y }) => `${TERRAIN_TILE_ZOOM}/${x}/${y}`).join("|");
+        if (loadedTerrainTileKeyRef.current === tileKey) {
+          terrainCoverageBoundsRef.current = {
+            west: Math.min(previousCoverage?.west ?? requiredCoverage.west, requiredCoverage.west),
+            east: Math.max(previousCoverage?.east ?? requiredCoverage.east, requiredCoverage.east),
+            south: Math.min(previousCoverage?.south ?? requiredCoverage.south, requiredCoverage.south),
+            north: Math.max(previousCoverage?.north ?? requiredCoverage.north, requiredCoverage.north),
+          };
+          setTerrainStatus("ready");
+          return;
+        }
+        if (pendingTerrainTileKeyRef.current === tileKey) return;
+        const requestId = ++terrainLoadSerial;
+        pendingTerrainTileKeyRef.current = tileKey;
+        setTerrainStatus("loading");
+        setTerrainNote(`Loading ${coordinates.length} bare-earth elevation tile${coordinates.length === 1 ? "" : "s"}…`);
+        try {
+          const loaded = await mapWithConcurrency(coordinates, TERRAIN_FETCH_CONCURRENCY, async ({ x, y }) => ({
+            x,
+            y,
+            raster: await loadTerrainTile(TERRAIN_TILE_ZOOM, x, y),
+          }));
+          if (disposed || requestId !== terrainLoadSerial) return;
+          if (loaded.some(({ raster }) => !raster)) throw new Error("One or more terrain tiles were unavailable.");
+          const completeTiles = loaded as Array<{ x: number; y: number; raster: TerrainRaster }>;
+          const cells = await terrainCellsFromTiles(completeTiles, TERRAIN_TILE_ZOOM);
+          if (disposed || requestId !== terrainLoadSerial) return;
+          setTerrainCells(cells);
+          loadedTerrainTileKeyRef.current = tileKey;
+          pendingTerrainTileKeyRef.current = null;
+          terrainCoverageBoundsRef.current = requiredCoverage;
+          setTerrainStatus("ready");
+          setTerrainNote(`${cells.length.toLocaleString()} conservative surface cells · ${coordinates.length} z${TERRAIN_TILE_ZOOM} elevation tile${coordinates.length === 1 ? "" : "s"}`);
+        } catch (error) {
+          console.error("Terrain tile load failed", error);
+          if (!disposed && requestId === terrainLoadSerial) {
+            clearTerrain();
+            setTerrainStatus("error");
+            setTerrainNote("Bare-earth elevation tiles could not be reached. Reload to try again.");
+          }
+        }
+      };
+      terrainReloadRef.current = () => { void loadVisibleTerrainTiles(); };
 
       const loadVisibleBuildingTiles = async () => {
         if (liveDataRef.current.sourceMode !== "overture" || !map.getSource("overture-buildings")) return;
@@ -837,7 +1163,10 @@ export function AirspacePlanner() {
         setMapReady(true);
         setBasemapError(false);
         setCoverageStatus("loading");
+        setTerrainStatus("loading");
         setDataNote("Connecting to Overture building archive…");
+        setTerrainNote("Connecting to bare-earth elevation tiles…");
+        void loadVisibleTerrainTiles();
         requestAnimationFrame(async () => {
           try {
             const header = await archive.getHeader();
@@ -851,7 +1180,7 @@ export function AirspacePlanner() {
             map.addLayer({ id: "clearance-zone-fill", type: "fill", source: "clearance-zones", paint: { "fill-color": "#c08a2c", "fill-opacity": 0.07 } }, beforeId);
             map.addLayer({ id: "clearance-zone-line", type: "line", source: "clearance-zones", paint: { "line-color": "#8f6b28", "line-width": 1.25, "line-dasharray": [3, 2] } }, beforeId);
             map.addLayer({ id: "clearance-conflict-fill", type: "fill", source: "clearance-conflicts", paint: { "fill-color": "#df3d33", "fill-opacity": 0.25 } }, beforeId);
-            map.addLayer({ id: "clearance-conflict-line", type: "line", source: "clearance-conflicts", paint: { "line-color": "#bd3028", "line-width": 1 } }, beforeId);
+            map.addLayer({ id: "clearance-conflict-line", type: "line", source: "clearance-conflicts", filter: ["!", ["has", "source"]], paint: { "line-color": "#bd3028", "line-width": 1 } }, beforeId);
             map.addLayer({ id: "overture-building-fill", type: "fill", source: "overture-buildings", filter: ["==", ["get", "__sourceLayer"], "building"], paint: { "fill-color": ["step", ["get", "__renderHeightM"], "#89908e", 107, "#4e585c", 244, "#182229"], "fill-opacity": 0.84 } }, beforeId);
             map.addLayer({ id: "overture-building-part-fill", type: "fill", source: "overture-buildings", filter: ["==", ["get", "__sourceLayer"], "building_part"], paint: { "fill-color": ["step", ["get", "__renderHeightM"], "#7f8886", 107, "#465156", 244, "#111b21"], "fill-opacity": 0.9 } }, beforeId);
             map.addLayer({ id: "overture-building-line", type: "line", source: "overture-buildings", filter: ["==", ["get", "__sourceLayer"], "building"], paint: { "line-color": "#ffffff", "line-width": 0.65, "line-opacity": 0.72 } }, beforeId);
@@ -867,7 +1196,10 @@ export function AirspacePlanner() {
           }
         });
       });
-      map.on("moveend", () => { void loadVisibleBuildingTiles(); });
+      map.on("moveend", () => {
+        void loadVisibleBuildingTiles();
+        void loadVisibleTerrainTiles();
+      });
       map.on("click", (event) => {
         setSelectedLngLat([event.lngLat.lng, event.lngLat.lat]);
       });
@@ -882,10 +1214,15 @@ export function AirspacePlanner() {
     return () => {
       disposed = true;
       loadSerial += 1;
+      terrainLoadSerial += 1;
       overtureReloadRef.current = () => {};
+      terrainReloadRef.current = () => {};
       loadedTileKeyRef.current = null;
       loadedViewportKeyRef.current = null;
       pendingTileKeyRef.current = null;
+      terrainCoverageBoundsRef.current = null;
+      loadedTerrainTileKeyRef.current = null;
+      pendingTerrainTileKeyRef.current = null;
       mapRef.current?.remove();
       mapRef.current = null;
     };
@@ -907,6 +1244,7 @@ export function AirspacePlanner() {
 
   useEffect(() => {
     if (mapReady && sourceMode === "overture") overtureReloadRef.current();
+    if (mapReady) terrainReloadRef.current();
   }, [mapReady, sourceMode]);
 
   useEffect(() => {
@@ -939,6 +1277,8 @@ export function AirspacePlanner() {
       setDatasetName(file.name);
       setDataNote(`${imported.buildings.length.toLocaleString()} buildings · ${imported.note}`);
       setSelectedLngLat([imported.origin.lon, imported.origin.lat]);
+      setTerrainStatus("loading");
+      setTerrainNote("Loading surface elevations for the imported area…");
       mapRef.current?.flyTo({ center: [imported.origin.lon, imported.origin.lat], zoom: 15, essential: true });
     } catch (error) {
       setImportError(error instanceof Error ? error.message : "This file could not be read.");
@@ -993,7 +1333,30 @@ export function AirspacePlanner() {
       : coverageStatus === "ready"
         ? "Overture Maps · Coverage loaded"
         : "Overture Maps · View too wide";
-  const coverageBadge = coverageStatus === "loading" ? "LOADING" : coverageStatus === "error" ? "ERROR" : "NARROW VIEW";
+  const terrainCoverageLabel = terrainStatus === "loading"
+    ? "Surface elevation · Loading"
+    : terrainStatus === "error"
+      ? "Surface elevation · Unavailable"
+      : terrainStatus === "ready"
+        ? "Surface elevation · Loaded"
+        : "Surface elevation · View too wide";
+  const modelDataLabel = !buildingCoverageAvailable
+    ? sourceMode === "overture" ? overtureCoverageLabel : "Local buildings · Ready"
+    : terrainCoverageLabel;
+  const modelBadge = !buildingCoverageAvailable
+    ? coverageStatus === "loading" ? "LOADING" : coverageStatus === "error" ? "ERROR" : "NARROW VIEW"
+    : terrainStatus === "loading" ? "TERRAIN" : terrainStatus === "error" ? "ERROR" : "NARROW VIEW";
+  const unavailableMessage = modelAvailable && selectedSurfaceElevationFt == null
+    ? "No decoded surface elevation is available at the selected point, so no clearance conclusion is shown."
+    : coverageStatus === "zoom-required"
+    ? `The visible area and its 2,000-ft clearance halo exceed the ${MAX_VISIBLE_OVERTURE_TILES}-tile full-detail budget. Narrow the view to evaluate clearance.`
+    : terrainStatus === "zoom-required"
+      ? `Surface coverage exceeds the ${MAX_VISIBLE_OVERTURE_TILES}-tile elevation budget. Narrow the view to evaluate terrain clearance.`
+      : terrainStatus === "loading"
+        ? "Bare-earth surface elevations must load before clearance can be evaluated."
+        : terrainStatus === "error"
+          ? "Surface elevation coverage is unavailable, so no clearance conclusion is shown."
+          : "Building and surface coverage must load before clearance can be evaluated.";
 
   return (
     <main className="app-shell">
@@ -1001,7 +1364,7 @@ export function AirspacePlanner() {
         <button className="brand" onClick={activateOverture} aria-label="Clearance home and use automatic Overture buildings"><span className="brand-mark" aria-hidden="true"><i /></span><span>CLEARANCE</span></button>
         <div className="rule-chip"><span>RULESET</span> FAA §91.119(b)</div>
         <div className="topbar-actions">
-          <div className={`overture-status ${sourceMode === "local" ? "local" : modelAvailable ? "" : "paused"}`}><span className="status-dot" /><span><small>BUILDING DATA</small>{sourceMode === "overture" ? overtureCoverageLabel : "Local override · Overture paused"}</span></div>
+          <div className={`overture-status ${sourceMode === "local" ? "local" : modelAvailable ? "" : "paused"}`}><span className="status-dot" /><span><small>MODEL DATA</small>{modelDataLabel}</span></div>
           <button className="icon-button" onClick={() => setInfoOpen(true)} aria-label="About this planning aid">?</button>
           <input ref={inputRef} className="visually-hidden" type="file" accept=".csv,.geojson,.json,application/geo+json,text/csv" onChange={handleImport} />
         </div>
@@ -1010,22 +1373,24 @@ export function AirspacePlanner() {
       <section className="workspace">
         <aside className="control-panel">
           <div className="eyebrow-row"><span className="eyebrow">FLIGHT ALTITUDE</span><span className={`live-label ${modelAvailable ? "" : "paused"}`}><i /> ENVELOPE MODEL</span></div>
-          <div className="altitude-readout"><strong>{altitudeFt.toLocaleString()}</strong><span>FT<br />AGL</span></div>
-          <label className="slider-wrap"><span className="visually-hidden">Flight altitude in feet above ground level</span><input type="range" min="500" max="3000" step="50" value={altitudeFt} onChange={(event) => setAltitudeFt(Number(event.target.value))} /><span className="range-labels"><b>500</b><b>3,000 FT</b></span></label>
-          <div className="preset-row" aria-label="Altitude presets">{[1000, 1500, 2000, 2500].map((preset) => <button key={preset} className={altitudeFt === preset ? "active" : ""} onClick={() => setAltitudeFt(preset)}>{preset.toLocaleString()}</button>)}</div>
+          <div className="altitude-readout"><strong>{altitudeFt.toLocaleString()}</strong><span>FT<br />MSL</span></div>
+          <label className="slider-wrap"><span className="visually-hidden">Flight altitude in feet above mean sea level</span><input type="range" min="1000" max="18000" step="100" value={altitudeFt} onChange={(event) => setAltitudeFt(Number(event.target.value))} /><span className="range-labels"><b>1,000</b><b>18,000 FT MSL</b></span></label>
+          <div className="preset-row" aria-label="Altitude presets">{[2000, 5000, 10000, 15000].map((preset) => <button key={preset} className={altitudeFt === preset ? "active" : ""} onClick={() => setAltitudeFt(preset)}>{preset.toLocaleString()}</button>)}</div>
 
           <div className="rule-block">
             <div className="rule-heading"><span className="rule-number">§</span><span><small>MODELED STANDARD</small>91.119(b) clearance</span></div>
             <div className="rule-metrics"><div><strong>1,000</strong><span>FT ABOVE</span></div><i /><div><strong>2,000</strong><span>FT FROM ENVELOPE</span></div></div>
-            <p>The horizontal distance is measured from the nearest point on each complete building footprint—not its center.</p>
+            <p>Altitude is MSL. The model requires 1,000 ft above the bare-earth surface and above building tops within 2,000 ft horizontally.</p>
           </div>
 
           <div className={`point-check ${check.state}`} aria-live="polite">
             <div className="point-check-title"><span className="check-symbol">{check.state === "conflict" ? "!" : check.state === "clear" ? "✓" : check.state === "unavailable" ? "?" : "·"}</span><span><small>SELECTED POINT</small>{statusTitle}</span></div>
-            {check.state === "unavailable" ? <p>{coverageStatus === "zoom-required" ? `The visible area and its 2,000-ft clearance halo exceed the ${MAX_VISIBLE_OVERTURE_TILES}-tile full-detail budget. Narrow the view to evaluate clearance.` : "Overture building coverage must load before clearance can be evaluated."}</p> : check.state !== "outside" ? <dl>
-              <div><dt>Required altitude</dt><dd>{check.requiredFt?.toLocaleString()} ft</dd></div>
+            {check.state === "unavailable" ? <p>{unavailableMessage}</p> : check.state !== "outside" ? <dl>
+              <div><dt>Required altitude</dt><dd>{check.requiredFt?.toLocaleString()} ft MSL</dd></div>
               <div><dt>{(check.marginFt ?? 0) < 0 ? "Shortfall" : "Margin"}</dt><dd>{Math.abs(check.marginFt ?? 0).toLocaleString()} ft</dd></div>
-              <div><dt>Highest within 2,000 ft</dt><dd>{check.obstacle?.name ?? "Ground baseline"}</dd></div>
+              <div><dt>Surface cell maximum</dt><dd>{check.surfaceElevationFt?.toLocaleString()} ft MSL</dd></div>
+              <div><dt>Controlling surface</dt><dd>{check.controllingSource === "building" ? check.obstacle?.name ?? "Building" : "Bare earth"}</dd></div>
+              {check.obstacleTopElevationFt != null && <div><dt>Highest building top</dt><dd>{check.obstacleTopElevationFt.toLocaleString()} ft MSL</dd></div>}
               {check.obstacle && <div><dt>Distance to envelope</dt><dd>{Math.round(check.envelopeDistanceFt ?? 0).toLocaleString()} ft</dd></div>}
             </dl> : <p>Click inside a dashed amber study polygon to run the clearance screen.</p>}
           </div>
@@ -1037,18 +1402,23 @@ export function AirspacePlanner() {
             <strong>Overture Maps Buildings <b>↗</b></strong>
             <span>PMTiles {overtureRelease} · footprints, heights, and building parts</span>
           </a>
+          <a className="national-source terrain-source" href="https://registry.opendata.aws/terrain-tiles/" target="_blank" rel="noreferrer">
+            <span className="source-kicker">BARE-EARTH ELEVATION · AUTOMATIC</span>
+            <strong>Mapzen Terrain Tiles <b>↗</b></strong>
+            <span>Terrarium z{TERRAIN_TILE_ZOOM} · U.S. elevations sourced from USGS 3DEP/NED</span>
+          </a>
 
           <div className="panel-footer">
             <button onClick={() => setDetailsOpen((current) => !current)}>{detailsOpen ? "Hide" : "Show"} model details <span>{detailsOpen ? "−" : "+"}</span></button>
-            {detailsOpen && <div className="model-details"><p>Red geometry is a true 2,000-ft buffer around each active footprint, clipped to the study polygon.</p><p>Terrain, airspace, temporary restrictions, weather, routes, takeoff/landing exceptions, and §91.119(a)/(c)/(d) are not modeled.</p></div>}
+            {detailsOpen && <div className="model-details"><p>Red geometry combines conservative surface-elevation cells with a true 2,000-ft buffer around each active building footprint.</p><p>Airspace, temporary restrictions, weather, routes, takeoff/landing exceptions, and §91.119(a)/(c)/(d) are not modeled.</p></div>}
           </div>
         </aside>
 
         <section className="map-panel" aria-label="Interactive two-dimensional clearance map">
-          <div ref={mapContainerRef} className="map-container" aria-label={`Interactive basemap at ${altitudeFt} feet AGL. Red areas do not meet the modeled clearance. Click to check a point.`} />
+          <div ref={mapContainerRef} className="map-container" aria-label={`Interactive basemap at ${altitudeFt} feet MSL. Red areas do not meet the modeled clearance. Click to check a point.`} />
           {!mapReady && !basemapError && <div className="basemap-loading"><i />Loading basemap…</div>}
           {basemapError && !mapReady && <div className="basemap-loading error">Basemap unavailable. Check your connection.</div>}
-          <div className="map-titlebar"><div><span className="location-pin" aria-hidden="true" /><strong>{sourceMode === "overture" ? "Overture building envelopes" : datasetName}</strong><small>{origin.lat.toFixed(4)}° N, {Math.abs(origin.lon).toFixed(4)}° W</small></div><span className="map-mode">2D · AGL</span></div>
+          <div className="map-titlebar"><div><span className="location-pin" aria-hidden="true" /><strong>{sourceMode === "overture" ? "Building + surface clearance" : datasetName}</strong><small>{origin.lat.toFixed(4)}° N, {Math.abs(origin.lon).toFixed(4)}° W</small></div><span className="map-mode">2D · MSL</span></div>
           <div className="map-controls" aria-label="Map zoom controls">
             <button onClick={() => mapRef.current?.zoomIn()} aria-label="Zoom in">＋</button>
             <button onClick={() => mapRef.current?.zoomOut()} aria-label="Zoom out">−</button>
@@ -1058,8 +1428,8 @@ export function AirspacePlanner() {
             <button className={basemap === "street" ? "active" : ""} aria-pressed={basemap === "street"} onClick={() => setBasemap("street")}>Street</button>
             <button className={basemap === "sectional" ? "active" : ""} aria-pressed={basemap === "sectional"} title="Sectionals with Terminal Area Charts where available" onClick={() => setBasemap("sectional")}>FAA Charts</button>
           </div>
-          <div className="legend" aria-label="Map legend"><span><i className="legend-red" />Envelope conflict</span><span><i className="legend-amber" />Study polygon</span><span><i className="legend-building" />Building envelope</span></div>
-          <div className="dataset-card"><span className="dataset-icon" aria-hidden="true">▤</span><span><small>{sourceMode === "overture" ? "AUTOMATIC BUILDING LAYER" : "LOCAL OVERRIDE"}</small><strong>{datasetName}</strong><em>{dataNote}</em></span>{sourceMode === "local" ? <button onClick={activateOverture}>Use Overture</button> : <span className={`data-live ${modelAvailable ? "" : "paused"}`}>{modelAvailable ? "LIVE" : coverageBadge}</span>}</div>
+          <div className="legend" aria-label="Map legend"><span><i className="legend-red" />Clearance conflict</span><span><i className="legend-amber" />Study polygon</span><span><i className="legend-building" />Building envelope</span></div>
+          <div className="dataset-card"><span className="dataset-icon" aria-hidden="true">▤</span><span><small>{sourceMode === "overture" ? "AUTOMATIC MODEL LAYERS" : "LOCAL BUILDINGS + TERRAIN"}</small><strong>{datasetName}</strong><em>{dataNote}</em><em>{terrainNote}</em></span>{sourceMode === "local" ? <button onClick={activateOverture}>Use Overture</button> : <span className={`data-live ${modelAvailable ? "" : "paused"}`}>{modelAvailable ? "LIVE" : modelBadge}</span>}</div>
           <div className="basemap-badge">BASEMAP · {basemap === "street" ? "CARTO / OPENSTREETMAP" : "FAA SECTIONAL + TAC"}</div>
         </section>
       </section>
@@ -1072,10 +1442,12 @@ export function AirspacePlanner() {
         <section className="info-modal" role="dialog" aria-modal="true" aria-labelledby="limitations-title">
           <button className="modal-close" onClick={() => setInfoOpen(false)} aria-label="Close">×</button>
           <span className="modal-kicker">MODEL NOTES</span>
-          <h2 id="limitations-title">Full envelopes, with important limits.</h2>
-          <p>GeoJSON Polygon and MultiPolygon outer footprints are preserved. The red geometry begins at the closest footprint edge, buffers it by 2,000 feet, and compares the selected altitude with the building height plus 1,000 feet.</p>
+          <h2 id="limitations-title">Full envelopes and terrain, with important limits.</h2>
+          <p>The aircraft altitude is modeled in feet MSL. Required altitude is the greater of bare-earth surface elevation plus 1,000 feet, or a nearby building’s ground elevation plus its height plus 1,000 feet.</p>
+          <p>GeoJSON Polygon and MultiPolygon outer footprints are preserved. The building conflict geometry begins at the closest footprint edge and buffers it by 2,000 feet.</p>
           <p>When more than 500 obstacles are active in one view, nearby envelopes are conservatively grouped for the red overlay so the altitude control stays responsive. The selected-point check still tests the individual building envelopes.</p>
-          <p>Overture buildings and clearance evaluation always use the archive’s maximum-detail tiles, independent of camera zoom. The loader includes a 2,000-ft halo around the view so edge points can be checked; coverage spanning more than {MAX_VISIBLE_OVERTURE_TILES} full-detail tiles is explicitly not evaluated.</p>
+          <p>Terrain tiles are divided into 64×64-pixel cells. Each cell uses its highest DEM pixel, so the surface screen is intentionally conservative. DEM elevations are planning data, not surveyed obstacle or navigation values.</p>
+          <p>Building and terrain evaluation use fixed full-detail tiles independent of camera zoom. The loader includes a 2,000-ft halo around the view so edge points can be checked; coverage spanning more than {MAX_VISIBLE_OVERTURE_TILES} tiles is explicitly not evaluated.</p>
           <p>The FAA evaluates whether an area is “congested” case by case. The visible map extent is treated as a conservative study area—not labeled as an official FAA boundary.</p>
           <div className="modal-warning"><b>Small UAS note</b><span>Part 107 generally uses a different 400-foot AGL framework and may require airspace authorization. This prototype models the Part 91 rule named above.</span></div>
           <div className="source-detail">
@@ -1083,8 +1455,13 @@ export function AirspacePlanner() {
             <p>The map loads Overture’s official global Buildings PMTiles archive for the current release. Polygon/MultiPolygon footprints, building parts, and available height fields feed the clearance model wherever the visible extent and its clearance halo fit within the full-detail tile budget.</p>
             <a href="https://docs.overturemaps.org/guides/buildings/" target="_blank" rel="noreferrer">Open Overture Buildings guide ↗</a>
           </div>
+          <div className="source-detail">
+            <h3>Bare-earth source: Mapzen Terrain Tiles</h3>
+            <p>Terrarium elevation tiles are loaded from the AWS Open Data terrain archive. United States terrain in this archive is attributed to USGS 3DEP/NED; elevations are decoded in meters and converted to feet MSL.</p>
+            <a href="https://registry.opendata.aws/terrain-tiles/" target="_blank" rel="noreferrer">Open AWS terrain dataset ↗</a>
+          </div>
           <div className="file-help"><h3>Advanced local override</h3><p>GeoJSON: use <code>height_ft</code>, Overture <code>height</code> (meters), <code>height_m</code>, <code>num_floors</code>, or <code>building:levels</code>. CSV: include <code>lat, lon, height_ft, width_ft, depth_ft</code>.</p><div className="file-actions"><button onClick={() => inputRef.current?.click()}>Import local file</button><button onClick={downloadTemplate}>Download CSV template</button>{sourceMode === "local" && <button onClick={activateOverture}>Return to Overture</button>}</div></div>
-          <div className="modal-links"><a href="https://www.faa.gov/about/office_org/headquarters_offices/agc/practice_areas/regulations/interpretations/Data/interps/2009/Anderson_2009_Legal_Interpretation.pdf" target="_blank" rel="noreferrer">FAA Anderson interpretation ↗</a><a href="https://carto.com/basemaps/" target="_blank" rel="noreferrer">Street basemap ↗</a><a href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/vfr/" target="_blank" rel="noreferrer">FAA chart sources ↗</a></div>
+          <div className="modal-links"><a href="https://www.faa.gov/about/office_org/headquarters_offices/agc/practice_areas/regulations/interpretations/Data/interps/2009/Anderson_2009_Legal_Interpretation.pdf" target="_blank" rel="noreferrer">FAA Anderson interpretation ↗</a><a href="https://www.usgs.gov/3d-elevation-program" target="_blank" rel="noreferrer">USGS 3DEP ↗</a><a href="https://carto.com/basemaps/" target="_blank" rel="noreferrer">Street basemap ↗</a><a href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/vfr/" target="_blank" rel="noreferrer">FAA chart sources ↗</a></div>
         </section>
       </div>}
     </main>
