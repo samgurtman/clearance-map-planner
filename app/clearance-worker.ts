@@ -56,6 +56,7 @@ const SQUARE_METERS_PER_SQUARE_MILE = 2_589_988.110336;
 const RESULT_CACHE_SIZE = 12;
 
 let buildings: Building[] = [];
+let groupedBuildings: Building[] = [];
 let terrainCells: TerrainCell[] = [];
 let zones: Zone[] = [];
 let origin: Origin = { lat: 0, lon: 0 };
@@ -107,9 +108,9 @@ function buildingTopElevationFt(building: Building) {
   return building.groundElevationFt == null ? null : building.groundElevationFt + building.heightFt;
 }
 
-function groupDenseBuildings(activeBuildings: Building[], cellSize = 750): Building[] {
+function groupDenseBuildings(allBuildings: Building[], cellSize = 750): Building[] {
   const groups = new Map<string, { minX: number; minY: number; maxX: number; maxY: number; heightFt: number; groundElevationFt?: number; topElevationFt: number; count: number }>();
-  activeBuildings.forEach((building) => {
+  allBuildings.forEach((building) => {
     const key = `${Math.floor(building.x / cellSize)}:${Math.floor(building.y / cellSize)}`;
     const points = building.envelopes.flat();
     const current = groups.get(key) || { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity, heightFt: 0, topElevationFt: -Infinity, count: 0 };
@@ -279,7 +280,12 @@ function computeConflicts(requestId: number, altitudeFt: number): ConflictResult
     const topElevationFt = buildingTopElevationFt(building);
     return topElevationFt != null && altitudeFt < topElevationFt + 1000;
   });
-  const displayBuildings = activeBuildings.length > 500 ? groupDenseBuildings(activeBuildings) : activeBuildings;
+  const displayBuildings = activeBuildings.length > 500
+    ? groupedBuildings.filter((building) => {
+      const topElevationFt = buildingTopElevationFt(building);
+      return topElevationFt != null && altitudeFt < topElevationFt + 1000;
+    })
+    : activeBuildings;
   const activeTerrainCells = terrainCells
     .filter((cell) => terrainCellIntersectsBounds(cell) && altitudeFt < cell.elevationFt + 1000);
   const features: Array<Feature<Polygon | MultiPolygon>> = compactTerrainFeatures(activeTerrainCells);
@@ -308,6 +314,7 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   try {
     if (message.type === "prepare") {
       buildings = message.buildings;
+      groupedBuildings = buildings.length > 500 ? groupDenseBuildings(buildings) : [];
       terrainCells = message.terrainCells;
       zones = message.zones;
       origin = message.origin;

@@ -76,6 +76,7 @@ const OVERTURE_PERSISTENT_CACHE_MAX_TILES = 256;
 const OVERTURE_PERSISTENT_CACHE_MAX_BYTES = 256 * 1024 * 1024;
 const MAX_VISIBLE_OVERTURE_TILES = 128;
 const CLEARANCE_DISTANCE_FT = 2000;
+const CLEARANCE_WORKER_TIMEOUT_MS = 75_000;
 const FEET_PER_LAT_DEGREE = 364_000;
 const feetPerLonDegree = (latitude: number) => 364_000 * Math.cos((latitude * Math.PI) / 180);
 
@@ -841,12 +842,32 @@ export function AirspacePlanner() {
     let workerRequestSerial = 0;
     let latestWorkerRequestId = 0;
     let overlayUpdateSerial = 0;
+    let queuedOverlayAltitude: number | null = null;
+    let overlayComputePromise: Promise<boolean> | null = null;
     let worker: Worker | null = null;
     const workerRequests = new Map<number, {
       resolve: (result: ClearanceWorkerResult) => void;
       reject: (error: Error) => void;
       onProgress?: (value: number, label: string) => void;
+      timeoutId: number;
     }>();
+
+    const rejectWorkerRequests = (error: Error) => {
+      const requests = [...workerRequests.values()];
+      workerRequests.clear();
+      requests.forEach(({ reject, timeoutId }) => {
+        window.clearTimeout(timeoutId);
+        reject(error);
+      });
+    };
+
+    const stopWorker = (error: Error) => {
+      const activeWorker = worker;
+      worker = null;
+      activeWorker?.terminate();
+      workerModelReadyRef.current = false;
+      rejectWorkerRequests(error);
+    };
 
     const handleWorkerMessage = (event: MessageEvent<Record<string, unknown>>) => {
       const requestId = Number(event.data.requestId);
@@ -857,6 +878,7 @@ export function AirspacePlanner() {
         return;
       }
       workerRequests.delete(requestId);
+      window.clearTimeout(request.timeoutId);
       if (event.data.type === "error") {
         request.reject(new Error(String(event.data.message || "Clearance geometry could not be calculated.")));
         return;
@@ -866,9 +888,18 @@ export function AirspacePlanner() {
 
     const ensureWorker = () => {
       if (worker) return worker;
-      worker = new Worker(clearanceWorkerUrl, { type: "module" });
-      worker.onmessage = handleWorkerMessage;
-      return worker;
+      const nextWorker = new Worker(clearanceWorkerUrl, { type: "module" });
+      nextWorker.onmessage = handleWorkerMessage;
+      nextWorker.onerror = () => {
+        if (worker !== nextWorker) return;
+        stopWorker(new Error("The clearance worker stopped unexpectedly."));
+      };
+      nextWorker.onmessageerror = () => {
+        if (worker !== nextWorker) return;
+        stopWorker(new Error("The clearance worker returned an unreadable result."));
+      };
+      worker = nextWorker;
+      return nextWorker;
     };
 
     const requestWorker = (
@@ -878,7 +909,11 @@ export function AirspacePlanner() {
       const requestId = ++workerRequestSerial;
       latestWorkerRequestId = requestId;
       return new Promise<ClearanceWorkerResult>((resolve, reject) => {
-        workerRequests.set(requestId, { resolve, reject, onProgress });
+        const timeoutId = window.setTimeout(() => {
+          if (!workerRequests.has(requestId)) return;
+          stopWorker(new Error("The clearance calculation exceeded the time limit."));
+        }, CLEARANCE_WORKER_TIMEOUT_MS);
+        workerRequests.set(requestId, { resolve, reject, onProgress, timeoutId });
         ensureWorker().postMessage({ ...message, requestId });
       }).then((result) => ({ result, requestId }));
     };
@@ -893,6 +928,7 @@ export function AirspacePlanner() {
     invalidateModelRef.current = () => {
       areaRenderSerial += 1;
       overlayUpdateSerial += 1;
+      queuedOverlayAltitude = null;
       latestWorkerRequestId = ++workerRequestSerial;
       workerModelReadyRef.current = false;
       renderedAltitudeRef.current = null;
@@ -901,18 +937,42 @@ export function AirspacePlanner() {
 
     computeOverlayRef.current = async (nextAltitudeFt: number) => {
       if (!workerModelReadyRef.current || disposed) return false;
-      const updateId = ++overlayUpdateSerial;
+      queuedOverlayAltitude = nextAltitudeFt;
       setOverlayUpdating(true);
+      if (overlayComputePromise) return overlayComputePromise;
+      const updateId = overlayUpdateSerial;
+      const pending = (async () => {
+        let applied = false;
+        try {
+          while (!disposed && workerModelReadyRef.current && queuedOverlayAltitude != null) {
+            const targetAltitude = queuedOverlayAltitude;
+            queuedOverlayAltitude = null;
+            const { result, requestId } = await requestWorker({ type: "compute", altitudeFt: targetAltitude });
+            if (disposed || updateId !== overlayUpdateSerial || requestId !== latestWorkerRequestId) return false;
+            if (queuedOverlayAltitude != null || targetAltitude !== liveDataRef.current.altitudeFt) continue;
+            applyWorkerResult(result);
+            applied = true;
+          }
+          return applied;
+        } catch (error) {
+          console.error("Clearance overlay update failed", error);
+          if (!disposed && updateId === overlayUpdateSerial) {
+            workerModelReadyRef.current = false;
+            renderedAltitudeRef.current = null;
+            setRenderedBounds(null);
+            setConflictsGeoJson(featureCollection([]));
+            setActiveObstacles(0);
+            setFlaggedSquareMiles(0);
+            setRenderError("The clearance overlay update stopped. Press Render to retry this area.");
+          }
+          return false;
+        }
+      })();
+      overlayComputePromise = pending;
       try {
-        const response = await requestWorker({ type: "compute", altitudeFt: nextAltitudeFt });
-        const { result, requestId } = response;
-        if (disposed || requestId !== latestWorkerRequestId) return false;
-        applyWorkerResult(result);
-        return true;
-      } catch (error) {
-        console.error("Clearance overlay update failed", error);
-        return false;
+        return await pending;
       } finally {
+        if (overlayComputePromise === pending) overlayComputePromise = null;
         if (!disposed && updateId === overlayUpdateSerial) setOverlayUpdating(false);
       }
     };
@@ -1286,6 +1346,7 @@ export function AirspacePlanner() {
       renderAreaRef.current = async (selection: RenderBounds) => {
         const renderId = ++areaRenderSerial;
         overlayUpdateSerial += 1;
+        queuedOverlayAltitude = null;
         latestWorkerRequestId = ++workerRequestSerial;
         workerModelReadyRef.current = false;
         renderedAltitudeRef.current = null;
@@ -1474,8 +1535,7 @@ export function AirspacePlanner() {
       invalidateModelRef.current = () => undefined;
       workerModelReadyRef.current = false;
       renderedAltitudeRef.current = null;
-      workerRequests.forEach(({ reject }) => reject(new Error("Clearance worker was stopped.")));
-      workerRequests.clear();
+      rejectWorkerRequests(new Error("Clearance worker was stopped."));
       worker?.terminate();
       drawingAreaRef.current = false;
       selectionStartRef.current = null;
