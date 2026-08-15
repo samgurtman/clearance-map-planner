@@ -208,7 +208,7 @@ button { color: inherit; }
 .national-source strong { font-size: 11px; }
 .national-source strong b { color: var(--signal); }
 .national-source > span:last-child { color: #6f777a; font-size: 8px; line-height: 1.45; }
-.terrain-source, .faa-source { margin-top: 8px; }
+.terrain-source, .water-source, .faa-source { margin-top: 8px; }
 
 .legal-bar { min-height: 34px; flex: 0 0 34px; display: flex; align-items: center; justify-content: center; gap: 13px; padding: 4px 18px; background: var(--ink); color: #cfd4d5; font-size: 8px; letter-spacing: .03em; text-align: center; }
 .legal-bar b { color: white; margin-right: 5px; }

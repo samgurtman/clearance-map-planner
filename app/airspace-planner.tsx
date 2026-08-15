@@ -46,6 +46,7 @@ type TerrainCell = {
   south: number;
   north: number;
   elevationFt: number;
+  openWater?: boolean;
 };
 type Check = {
   state: "conflict" | "clear" | "outside" | "unavailable";
@@ -57,6 +58,7 @@ type Check = {
   requiredFt?: number;
   marginFt?: number;
   envelopeDistanceFt?: number;
+  openWater?: boolean;
 };
 type ImportedDataset = { buildings: Building[]; origin: Origin; note: string };
 type CoverageStatus = "idle" | "loading" | "ready" | "zoom-required" | "error";
@@ -74,6 +76,13 @@ type FaaObstacleManifest = {
   recordCount: number;
   cells: Record<string, number>;
 };
+type OpenWaterArea = {
+  west: number;
+  east: number;
+  south: number;
+  north: number;
+  polygons: number[][][][];
+};
 
 const CHICAGO_ORIGIN: Origin = { lat: 41.8819, lon: -87.6324 };
 const OVERTURE_FALLBACK_RELEASE = "2026-07-22.0";
@@ -84,6 +93,9 @@ const TERRAIN_TILE_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrariu
 const FAA_OBSTACLE_DATA_ROOT = "/data/faa-obstacles";
 const TERRAIN_TILE_ZOOM = 14;
 const TERRAIN_CELL_DIVISIONS = 4;
+const WATER_TILE_ZOOM = 10;
+const WATER_CELL_SAMPLE_DIVISIONS = 7;
+const WATER_EDGE_GUARD_FT = 250;
 const TERRAIN_MEMORY_CACHE_MAX_TILES = 192;
 const TERRAIN_FETCH_CONCURRENCY = 8;
 const OVERTURE_FETCH_CONCURRENCY = 10;
@@ -92,7 +104,7 @@ const OVERTURE_TILE_CACHE_STORE = "tiles";
 const OVERTURE_TILE_CACHE_META_STORE = "metadata";
 const OVERTURE_MEMORY_CACHE_MAX_TILES = 48;
 const OVERTURE_MEMORY_CACHE_MAX_BYTES = 64 * 1024 * 1024;
-const OVERTURE_PERSISTENT_CACHE_MAX_TILES = 256;
+const OVERTURE_PERSISTENT_CACHE_MAX_TILES = 512;
 const OVERTURE_PERSISTENT_CACHE_MAX_BYTES = 256 * 1024 * 1024;
 const MIN_TILE_BUDGET = 32;
 const MAX_TILE_BUDGET = 256;
@@ -102,6 +114,8 @@ const FAA_MAX_HORIZONTAL_ACCURACY_FT = 6076;
 const CLEARANCE_WORKER_TIMEOUT_MS = 75_000;
 const FEET_PER_LAT_DEGREE = 364_000;
 const feetPerLonDegree = (latitude: number) => 364_000 * Math.cos((latitude * Math.PI) / 180);
+const OPEN_WATER_SUBTYPES = new Set(["ocean", "lake", "pond", "reservoir", "river", "stream", "water", "canal"]);
+const NON_OPEN_WATER_CLASSES = new Set(["swimming_pool", "wastewater", "sewage", "reflecting_pool", "water_storage", "fishpond"]);
 
 type OvertureTileCacheMetadata = { key: string; byteLength: number; lastUsed: number };
 type TerrainTileSummary = { cells: TerrainCell[] };
@@ -218,6 +232,85 @@ async function mapWithConcurrency<T, R>(items: T[], concurrency: number, mapper:
   });
   await Promise.all(workers);
   return results;
+}
+
+function pointOnCoordinateSegment(longitude: number, latitude: number, start: number[], end: number[]) {
+  const dx = end[0] - start[0];
+  const dy = end[1] - start[1];
+  const squaredLength = dx * dx + dy * dy;
+  if (squaredLength <= 1e-20) return Math.abs(longitude - start[0]) <= 1e-10 && Math.abs(latitude - start[1]) <= 1e-10;
+  const cross = (longitude - start[0]) * dy - (latitude - start[1]) * dx;
+  if (Math.abs(cross) > 1e-10) return false;
+  const dot = (longitude - start[0]) * dx + (latitude - start[1]) * dy;
+  return dot >= -1e-10 && dot <= squaredLength + 1e-10;
+}
+
+function pointInCoordinateRing(longitude: number, latitude: number, ring: number[][]) {
+  let inside = false;
+  for (let index = 0, previous = ring.length - 1; index < ring.length; previous = index, index += 1) {
+    const start = ring[previous];
+    const end = ring[index];
+    if (pointOnCoordinateSegment(longitude, latitude, start, end)) return true;
+    const crosses = (end[1] > latitude) !== (start[1] > latitude)
+      && longitude < ((start[0] - end[0]) * (latitude - end[1])) / (start[1] - end[1] || 1) + end[0];
+    if (crosses) inside = !inside;
+  }
+  return inside;
+}
+
+function pointInOpenWaterArea(longitude: number, latitude: number, area: OpenWaterArea) {
+  if (longitude < area.west || longitude > area.east || latitude < area.south || latitude > area.north) return false;
+  return area.polygons.some((rings) => {
+    if (!rings.length || !pointInCoordinateRing(longitude, latitude, rings[0])) return false;
+    return !rings.slice(1).some((hole) => pointInCoordinateRing(longitude, latitude, hole));
+  });
+}
+
+function openWaterAreaFromFeature(feature: Feature<Polygon | MultiPolygon>): OpenWaterArea {
+  const polygons = feature.geometry.type === "Polygon" ? [feature.geometry.coordinates] : feature.geometry.coordinates;
+  const bounds = { west: Infinity, east: -Infinity, south: Infinity, north: -Infinity };
+  polygons.forEach((rings) => rings.forEach((ring) => ring.forEach(([longitude, latitude]) => {
+    bounds.west = Math.min(bounds.west, longitude);
+    bounds.east = Math.max(bounds.east, longitude);
+    bounds.south = Math.min(bounds.south, latitude);
+    bounds.north = Math.max(bounds.north, latitude);
+  })));
+  return { ...bounds, polygons };
+}
+
+function isOpenWaterFeature(properties: Record<string, unknown>) {
+  const subtype = String(properties.subtype || "").toLowerCase();
+  const waterClass = String(properties.class || "").toLowerCase();
+  const sourceTags = String(properties.source_tags || "").toLowerCase();
+  const intermittent = properties.is_intermittent === true || properties.is_intermittent === "true";
+  const artificialSmallWater = sourceTags.includes('"amenity":"fountain"')
+    || sourceTags.includes('"leisure":"swimming_pool"')
+    || sourceTags.includes('"water":"wastewater"')
+    || sourceTags.includes('"man_made":"clarifier"')
+    || sourceTags.includes('"playground":"splash_pad"');
+  return !intermittent
+    && !artificialSmallWater
+    && !NON_OPEN_WATER_CLASSES.has(waterClass)
+    && OPEN_WATER_SUBTYPES.has(subtype);
+}
+
+function terrainCellIsConfidentOpenWater(cell: TerrainCell, waterAreas: OpenWaterArea[]) {
+  const latitudeGuard = WATER_EDGE_GUARD_FT / FEET_PER_LAT_DEGREE;
+  const longitudeGuard = WATER_EDGE_GUARD_FT / Math.max(1, feetPerLonDegree((cell.north + cell.south) / 2));
+  const west = cell.west - longitudeGuard;
+  const east = cell.east + longitudeGuard;
+  const south = cell.south - latitudeGuard;
+  const north = cell.north + latitudeGuard;
+  const candidates = waterAreas.filter((area) => area.west <= east && area.east >= west && area.south <= north && area.north >= south);
+  if (!candidates.length) return false;
+  for (let row = 0; row < WATER_CELL_SAMPLE_DIVISIONS; row += 1) {
+    const latitude = south + (north - south) * (row / (WATER_CELL_SAMPLE_DIVISIONS - 1));
+    for (let column = 0; column < WATER_CELL_SAMPLE_DIVISIONS; column += 1) {
+      const longitude = west + (east - west) * (column / (WATER_CELL_SAMPLE_DIVISIONS - 1));
+      if (!candidates.some((area) => pointInOpenWaterArea(longitude, latitude, area))) return false;
+    }
+  }
+  return true;
 }
 
 async function loadFaaObstacleManifest() {
@@ -566,10 +659,10 @@ function buildingTopElevationFt(building: Building) {
   return building.groundElevationFt == null ? null : building.groundElevationFt + building.heightFt;
 }
 
-function evaluatePointRequirement(value: Point, buildings: Building[], zones: Zone[], surfaceElevationFt: number | null): Check {
+function evaluatePointRequirement(value: Point, buildings: Building[], zones: Zone[], surfaceElevationFt: number | null, openWater: boolean): Check {
   const zone = zones.find((candidate) => pointInPolygon(value, candidate.points));
   if (!zone) return { state: "outside" };
-  if (surfaceElevationFt == null) return { state: "unavailable", zone };
+  if (surfaceElevationFt == null && !openWater) return { state: "unavailable", zone };
   let highest: { building: Building; distance: number } | undefined;
   for (const building of buildings) {
     const topElevationFt = buildingTopElevationFt(building);
@@ -577,9 +670,10 @@ function evaluatePointRequirement(value: Point, buildings: Building[], zones: Zo
     const distance = distanceToBuilding(value, building);
     if (distance <= CLEARANCE_DISTANCE_FT && (!highest || topElevationFt > (buildingTopElevationFt(highest.building) ?? -Infinity))) highest = { building, distance };
   }
-  const surfaceRequiredFt = surfaceElevationFt + 1000;
+  const surfaceRequiredFt = openWater || surfaceElevationFt == null ? -Infinity : surfaceElevationFt + 1000;
   const obstacleTopElevationFt = highest ? buildingTopElevationFt(highest.building) ?? undefined : undefined;
   const buildingRequiredFt = obstacleTopElevationFt == null ? -Infinity : obstacleTopElevationFt + 1000;
+  if (!Number.isFinite(surfaceRequiredFt) && !Number.isFinite(buildingRequiredFt)) return { state: "clear", zone, openWater: true };
   const controllingSource = buildingRequiredFt > surfaceRequiredFt ? "obstacle" : "surface";
   const requiredFt = Math.ceil(Math.max(surfaceRequiredFt, buildingRequiredFt));
   return {
@@ -591,6 +685,7 @@ function evaluatePointRequirement(value: Point, buildings: Building[], zones: Zo
     obstacleTopElevationFt,
     requiredFt,
     envelopeDistanceFt: highest?.distance,
+    openWater,
   };
 }
 
@@ -874,14 +969,18 @@ function terrainCellId(zoom: number, tileColumn: number, tileRow: number, cellCo
   return `${zoom}/${tileColumn}/${tileRow}/${cellColumn}/${cellRow}`;
 }
 
-function terrainElevationAtLngLat(lon: number, lat: number, terrainIndex: Map<string, TerrainCell>) {
+function terrainCellAtLngLat(lon: number, lat: number, terrainIndex: Map<string, TerrainCell>) {
   const xPosition = tileXPosition(lon, TERRAIN_TILE_ZOOM);
   const yPosition = tileYPosition(lat, TERRAIN_TILE_ZOOM);
   const tileColumn = Math.floor(xPosition);
   const tileRow = Math.floor(yPosition);
   const cellColumn = Math.max(0, Math.min(TERRAIN_CELL_DIVISIONS - 1, Math.floor((xPosition - tileColumn) * TERRAIN_CELL_DIVISIONS)));
   const cellRow = Math.max(0, Math.min(TERRAIN_CELL_DIVISIONS - 1, Math.floor((yPosition - tileRow) * TERRAIN_CELL_DIVISIONS)));
-  return terrainIndex.get(terrainCellId(TERRAIN_TILE_ZOOM, tileColumn, tileRow, cellColumn, cellRow))?.elevationFt ?? null;
+  return terrainIndex.get(terrainCellId(TERRAIN_TILE_ZOOM, tileColumn, tileRow, cellColumn, cellRow)) ?? null;
+}
+
+function terrainElevationAtLngLat(lon: number, lat: number, terrainIndex: Map<string, TerrainCell>) {
+  return terrainCellAtLngLat(lon, lat, terrainIndex)?.elevationFt ?? null;
 }
 
 function addGroundElevations(buildings: Building[], origin: Origin, terrainIndex: Map<string, TerrainCell>) {
@@ -982,7 +1081,7 @@ export function AirspacePlanner() {
   const [coverageStatus, setCoverageStatus] = useState<CoverageStatus>("idle");
   const [terrainCells, setTerrainCells] = useState<TerrainCell[]>([]);
   const [terrainStatus, setTerrainStatus] = useState<TerrainStatus>("idle");
-  const [terrainNote, setTerrainNote] = useState("Surface elevations render only for the selected area");
+  const [terrainNote, setTerrainNote] = useState("Surface elevations and open-water masking render only for the selected area");
   const [faaObstacleStatus, setFaaObstacleStatus] = useState<FaaObstacleStatus>("idle");
   const [faaObstacleNote, setFaaObstacleNote] = useState("FAA obstacles render only for the selected area");
   const [faaObstacleCount, setFaaObstacleCount] = useState(0);
@@ -1031,12 +1130,14 @@ export function AirspacePlanner() {
   const selected = useMemo(() => lngLatToLocal(selectedLngLat[0], selectedLngLat[1], origin), [selectedLngLat, origin]);
   const terrainIndex = useMemo(() => new Map(terrainCells.map((cell) => [cell.id, cell])), [terrainCells]);
   const modeledBuildings = useMemo(() => addGroundElevations(buildings, origin, terrainIndex), [buildings, origin, terrainIndex]);
-  const selectedSurfaceElevationFt = useMemo(() => terrainElevationAtLngLat(selectedLngLat[0], selectedLngLat[1], terrainIndex), [selectedLngLat, terrainIndex]);
+  const selectedTerrainCell = useMemo(() => terrainCellAtLngLat(selectedLngLat[0], selectedLngLat[1], terrainIndex), [selectedLngLat, terrainIndex]);
+  const selectedOverOpenWater = selectedTerrainCell?.openWater === true;
+  const selectedSurfaceElevationFt = selectedOverOpenWater ? null : selectedTerrainCell?.elevationFt ?? null;
   const buildingCoverageAvailable = sourceMode === "local" || coverageStatus === "ready";
   const modelAvailable = Boolean(renderedBounds) && buildingCoverageAvailable && terrainStatus === "ready" && faaObstacleStatus === "ready";
   const pointRequirement = useMemo<Check>(
-    () => modelAvailable ? evaluatePointRequirement(selected, modeledBuildings, zones, selectedSurfaceElevationFt) : { state: "unavailable" },
-    [modelAvailable, selected, modeledBuildings, zones, selectedSurfaceElevationFt],
+    () => modelAvailable ? evaluatePointRequirement(selected, modeledBuildings, zones, selectedSurfaceElevationFt, selectedOverOpenWater) : { state: "unavailable" },
+    [modelAvailable, selected, modeledBuildings, zones, selectedSurfaceElevationFt, selectedOverOpenWater],
   );
   const check = useMemo(() => applyAltitudeToCheck(pointRequirement, altitudeFt), [pointRequirement, altitudeFt]);
   const buildingsGeoJson = useMemo(
@@ -1216,6 +1317,7 @@ export function AirspacePlanner() {
       maplibregl.setWorkerUrl(maplibreWorkerUrl);
       let release = OVERTURE_FALLBACK_RELEASE;
       let archive = new PMTiles(`https://overturemaps-extras-us-west-2.s3.us-west-2.amazonaws.com/tiles/${release}/buildings.pmtiles`);
+      let waterArchive = new PMTiles(`https://overturemaps-extras-us-west-2.s3.us-west-2.amazonaws.com/tiles/${release}/base.pmtiles`);
       let fullTileZoom = 14;
       setOvertureRelease(release);
       setDatasetName(`Overture Maps · ${release}`);
@@ -1223,6 +1325,7 @@ export function AirspacePlanner() {
         if (disposed || typeof catalog?.latest !== "string" || catalog.latest === release) return;
         release = catalog.latest;
         archive = new PMTiles(`https://overturemaps-extras-us-west-2.s3.us-west-2.amazonaws.com/tiles/${release}/buildings.pmtiles`);
+        waterArchive = new PMTiles(`https://overturemaps-extras-us-west-2.s3.us-west-2.amazonaws.com/tiles/${release}/base.pmtiles`);
         setOvertureRelease(release);
         setDatasetName(`Overture Maps · ${release}`);
         void archive.getHeader().then((header) => {
@@ -1274,6 +1377,8 @@ export function AirspacePlanner() {
       mapRef.current = map;
 
       const loadVisibleTerrainTiles = async (selection: RenderBounds, onProgress?: (value: number) => void) => {
+        const requestRelease = release;
+        const requestWaterArchive = waterArchive;
         const center = { lat: (selection.south + selection.north) / 2, lng: (selection.west + selection.east) / 2 };
         const clearanceLatPadding = CLEARANCE_DISTANCE_FT / FEET_PER_LAT_DEGREE;
         const clearanceLonPadding = CLEARANCE_DISTANCE_FT / Math.max(1, feetPerLonDegree(center.lat));
@@ -1284,7 +1389,8 @@ export function AirspacePlanner() {
           north: selection.north + clearanceLatPadding,
         };
         const previousCoverage = terrainCoverageBoundsRef.current;
-        const alreadyCovered = Boolean(previousCoverage
+        const alreadyCovered = Boolean(loadedTerrainTileKeyRef.current?.startsWith(`${requestRelease}:`)
+          && previousCoverage
           && requiredCoverage.west >= previousCoverage.west
           && requiredCoverage.east <= previousCoverage.east
           && requiredCoverage.south >= previousCoverage.south
@@ -1324,7 +1430,16 @@ export function AirspacePlanner() {
         for (let x = minX; x <= maxX; x += 1) {
           for (let y = minY; y <= maxY; y += 1) coordinates.push({ x, y });
         }
-        const tileKey = coordinates.map(({ x, y }) => `${TERRAIN_TILE_ZOOM}/${x}/${y}`).join("|");
+        const maxWaterTile = (2 ** WATER_TILE_ZOOM) - 1;
+        const minimumWaterX = Math.max(0, Math.min(maxWaterTile, tileX(requiredCoverage.west, WATER_TILE_ZOOM)));
+        const maximumWaterX = Math.max(0, Math.min(maxWaterTile, tileX(requiredCoverage.east, WATER_TILE_ZOOM)));
+        const minimumWaterY = Math.max(0, Math.min(maxWaterTile, tileY(requiredCoverage.north, WATER_TILE_ZOOM)));
+        const maximumWaterY = Math.max(0, Math.min(maxWaterTile, tileY(requiredCoverage.south, WATER_TILE_ZOOM)));
+        const waterCoordinates: Array<{ x: number; y: number }> = [];
+        for (let x = minimumWaterX; x <= maximumWaterX; x += 1) {
+          for (let y = minimumWaterY; y <= maximumWaterY; y += 1) waterCoordinates.push({ x, y });
+        }
+        const tileKey = `${requestRelease}:${coordinates.map(({ x, y }) => `${TERRAIN_TILE_ZOOM}/${x}/${y}`).join("|")}`;
         if (loadedTerrainTileKeyRef.current === tileKey) {
           terrainCoverageBoundsRef.current = {
             west: Math.min(previousCoverage?.west ?? requiredCoverage.west, requiredCoverage.west),
@@ -1340,18 +1455,60 @@ export function AirspacePlanner() {
         const requestId = ++terrainLoadSerial;
         pendingTerrainTileKeyRef.current = tileKey;
         setTerrainStatus("loading");
-        setTerrainNote(`Loading ${coordinates.length} bare-earth elevation tile${coordinates.length === 1 ? "" : "s"}…`);
+        setTerrainNote(`Loading ${coordinates.length} bare-earth elevation tile${coordinates.length === 1 ? "" : "s"} and open-water coverage…`);
         try {
           let fetched = 0;
-          const loaded = await mapWithConcurrency(coordinates, TERRAIN_FETCH_CONCURRENCY, async ({ x, y }) => {
-            const summary = await loadTerrainTile(TERRAIN_TILE_ZOOM, x, y);
+          const totalRequests = coordinates.length + waterCoordinates.length;
+          const reportFetch = () => {
             fetched += 1;
-            onProgress?.(fetched / coordinates.length);
-            return summary;
-          });
+            onProgress?.(0.8 * (fetched / totalRequests));
+          };
+          const [loaded, waterTiles] = await Promise.all([
+            mapWithConcurrency(coordinates, TERRAIN_FETCH_CONCURRENCY, async ({ x, y }) => {
+              const summary = await loadTerrainTile(TERRAIN_TILE_ZOOM, x, y);
+              reportFetch();
+              return summary;
+            }),
+            mapWithConcurrency(waterCoordinates, OVERTURE_FETCH_CONCURRENCY, async ({ x, y }) => {
+              const tile = await loadCachedOvertureTile(
+                `base:${requestRelease}:${WATER_TILE_ZOOM}/${x}/${y}`,
+                async () => (await requestWaterArchive.getZxy(WATER_TILE_ZOOM, x, y))?.data || null,
+              );
+              reportFetch();
+              return { x, y, tile };
+            }),
+          ]);
           if (disposed || requestId !== terrainLoadSerial) return null;
           if (loaded.some((summary) => !summary)) throw new Error("One or more terrain tiles were unavailable.");
-          const cells = (loaded as TerrainTileSummary[]).flatMap((summary) => summary.cells);
+          const waterAreas: OpenWaterArea[] = [];
+          for (let tileIndex = 0; tileIndex < waterTiles.length; tileIndex += 1) {
+            const { x, y, tile } = waterTiles[tileIndex];
+            if (tile) {
+              const vectorTile = new VectorTile(new PbfReader(new Uint8Array(tile)));
+              const layer = vectorTile.layers.water;
+              if (layer) {
+                for (let featureIndex = 0; featureIndex < layer.length; featureIndex += 1) {
+                  const vectorFeature = layer.feature(featureIndex);
+                  const geojson = vectorFeature.toGeoJSON(x, y, WATER_TILE_ZOOM);
+                  if (!isOpenWaterFeature((geojson.properties || {}) as Record<string, unknown>)) continue;
+                  if (geojson.geometry.type !== "Polygon" && geojson.geometry.type !== "MultiPolygon") continue;
+                  waterAreas.push(openWaterAreaFromFeature(geojson as Feature<Polygon | MultiPolygon>));
+                }
+              }
+            }
+            onProgress?.(0.8 + 0.1 * ((tileIndex + 1) / Math.max(1, waterTiles.length)));
+          }
+          if (requestRelease !== release) {
+            pendingTerrainTileKeyRef.current = null;
+            return loadVisibleTerrainTiles(selection, onProgress);
+          }
+          let openWaterCellCount = 0;
+          const cells = (loaded as TerrainTileSummary[]).flatMap((summary) => summary.cells).map((cell) => {
+            const openWater = terrainCellIsConfidentOpenWater(cell, waterAreas);
+            if (openWater) openWaterCellCount += 1;
+            return openWater ? { ...cell, openWater: true } : cell;
+          });
+          onProgress?.(0.98);
           if (disposed || requestId !== terrainLoadSerial) return null;
           setTerrainCells(cells);
           loadedTerrainCellsDataRef.current = cells;
@@ -1359,7 +1516,7 @@ export function AirspacePlanner() {
           pendingTerrainTileKeyRef.current = null;
           terrainCoverageBoundsRef.current = requiredCoverage;
           setTerrainStatus("ready");
-          setTerrainNote(`${cells.length.toLocaleString()} conservative surface cells · ${coordinates.length} z${TERRAIN_TILE_ZOOM} elevation tile${coordinates.length === 1 ? "" : "s"}`);
+          setTerrainNote(`${(cells.length - openWaterCellCount).toLocaleString()} land/shoreline surface cells · ${openWaterCellCount.toLocaleString()} confident open-water cells excluded · ${coordinates.length} z${TERRAIN_TILE_ZOOM} elevation tile${coordinates.length === 1 ? "" : "s"}`);
           onProgress?.(1);
           return cells;
         } catch (error) {
@@ -1634,7 +1791,7 @@ export function AirspacePlanner() {
           lastProgressAt = now;
           lastProgressValue = value;
           const label = buildingProgress < 1 && (terrainProgress < 1 || faaProgress < 1)
-            ? "Loading buildings, FAA obstacles, and surface elevation"
+            ? "Loading buildings, FAA obstacles, surface elevation, and water coverage"
             : buildingProgress < 1
               ? "Decoding building envelopes"
               : faaProgress < 1
@@ -1926,7 +2083,7 @@ export function AirspacePlanner() {
       setSelectedLngLat([imported.origin.lon, imported.origin.lat]);
       setTerrainCells([]);
       setTerrainStatus("idle");
-      setTerrainNote("Surface elevations render only after you press Render");
+      setTerrainNote("Surface elevations and open-water masking render only after you press Render");
       setFaaObstacleStatus("idle");
       setFaaObstacleCount(0);
       setFaaObstacleNote("FAA obstacles render only after you press Render");
@@ -1969,7 +2126,7 @@ export function AirspacePlanner() {
     setSelectedLngLat([nextOrigin.lon, nextOrigin.lat]);
     setTerrainCells([]);
     setTerrainStatus("idle");
-    setTerrainNote("Surface elevations render only after you press Render");
+    setTerrainNote("Surface elevations and open-water masking render only after you press Render");
     setFaaObstacleStatus("idle");
     setFaaObstacleCount(0);
     setFaaObstacleNote("FAA obstacles render only after you press Render");
@@ -2016,7 +2173,7 @@ export function AirspacePlanner() {
   const statusTitle = check.state === "conflict"
     ? "Modeled clearance not met"
     : check.state === "clear"
-      ? "Modeled clearance met"
+      ? check.openWater && check.requiredFt == null ? "No modeled surface minimum" : "Modeled clearance met"
       : check.state === "unavailable"
         ? "Clearance not evaluated"
         : "Outside study polygons";
@@ -2102,16 +2259,16 @@ export function AirspacePlanner() {
           <div className="rule-block">
             <div className="rule-heading"><span className="rule-number">§</span><span><small>MODELED STANDARD</small>91.119(b) clearance</span></div>
             <div className="rule-metrics"><div><strong>1,000</strong><span>FT ABOVE</span></div><i /><div><strong>2,000</strong><span>FT FROM ENVELOPE</span></div></div>
-            <p>Altitude is MSL. The model requires 1,000 ft above bare earth, building tops, and FAA-listed obstacles within 2,000 ft horizontally.</p>
+            <p>Altitude is MSL. The model requires 1,000 ft above land/shoreline terrain, building tops, and FAA-listed obstacles within 2,000 ft horizontally. Confident open water has no surface-elevation minimum.</p>
           </div>
 
           <div className={`point-check ${check.state}`} aria-live="polite">
             <div className="point-check-title"><span className="check-symbol">{check.state === "conflict" ? "!" : check.state === "clear" ? "✓" : check.state === "unavailable" ? "?" : "·"}</span><span><small>SELECTED POINT</small>{statusTitle}</span></div>
             {check.state === "unavailable" ? <p>{unavailableMessage}</p> : check.state !== "outside" ? <dl>
-              <div><dt>Required altitude</dt><dd>{check.requiredFt?.toLocaleString()} ft MSL</dd></div>
-              <div><dt>{(check.marginFt ?? 0) < 0 ? "Shortfall" : "Margin"}</dt><dd>{Math.abs(check.marginFt ?? 0).toLocaleString()} ft</dd></div>
-              <div><dt>Surface cell maximum</dt><dd>{check.surfaceElevationFt?.toLocaleString()} ft MSL</dd></div>
-              <div><dt>Controlling surface</dt><dd>{check.controllingSource === "obstacle" ? check.obstacle?.name ?? "Obstacle" : "Bare earth"}</dd></div>
+              <div><dt>Required altitude</dt><dd>{check.requiredFt == null && check.openWater ? "None from water surface" : `${check.requiredFt?.toLocaleString()} ft MSL`}</dd></div>
+              {check.requiredFt != null && <div><dt>{(check.marginFt ?? 0) < 0 ? "Shortfall" : "Margin"}</dt><dd>{Math.abs(check.marginFt ?? 0).toLocaleString()} ft</dd></div>}
+              <div><dt>Surface cell maximum</dt><dd>{check.openWater ? "Open water · excluded" : `${check.surfaceElevationFt?.toLocaleString()} ft MSL`}</dd></div>
+              <div><dt>Controlling surface</dt><dd>{check.controllingSource === "obstacle" ? check.obstacle?.name ?? "Obstacle" : check.openWater ? "No modeled water-surface minimum" : "Bare earth"}</dd></div>
               {check.obstacleTopElevationFt != null && <div><dt>{check.obstacle?.sourceKind === "faa-obstacle" ? "FAA published obstacle top" : "Highest obstacle top"}</dt><dd>{check.obstacleTopElevationFt.toLocaleString()} ft MSL</dd></div>}
               {check.obstacle?.sourceKind === "faa-obstacle" && <div><dt>FAA accuracy code</dt><dd>{check.obstacle.accuracyCode || "Unknown"} · H {check.obstacle.horizontalAccuracyFt == null ? "unknown" : `±${check.obstacle.horizontalAccuracyFt.toLocaleString()} ft`} · V {check.obstacle.verticalAccuracyFt == null ? "unknown" : `±${check.obstacle.verticalAccuracyFt.toLocaleString()} ft`}</dd></div>}
               {check.obstacle && <div><dt>Distance to modeled envelope</dt><dd>{Math.round(check.envelopeDistanceFt ?? 0).toLocaleString()} ft</dd></div>}
@@ -2130,6 +2287,11 @@ export function AirspacePlanner() {
             <strong>Mapzen Terrain Tiles <b>↗</b></strong>
             <span>Terrarium z{TERRAIN_TILE_ZOOM} · U.S. elevations sourced from USGS 3DEP/NED</span>
           </a>
+          <a className="national-source water-source" href="https://docs.overturemaps.org/schema/reference/base/water/" target="_blank" rel="noreferrer">
+            <span className="source-kicker">OPEN-WATER MASK · AUTOMATIC</span>
+            <strong>Overture Maps Water <b>↗</b></strong>
+            <span>Permanent ocean and inland-water polygons · guarded shoreline classification</span>
+          </a>
           <a className="national-source faa-source" href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/DailyDOF/" target="_blank" rel="noreferrer">
             <span className="source-kicker">KNOWN AVIATION OBSTACLES · FAA SNAPSHOT</span>
             <strong>FAA Daily DOF <b>↗</b></strong>
@@ -2138,7 +2300,7 @@ export function AirspacePlanner() {
 
           <div className="panel-footer">
             <button onClick={() => setDetailsOpen((current) => !current)}>{detailsOpen ? "Hide" : "Show"} model details <span>{detailsOpen ? "−" : "+"}</span></button>
-            {detailsOpen && <div className="model-details"><p>Red geometry combines conservative surface-elevation cells with a 2,000-ft buffer around active Overture envelopes and FAA obstacle points. Known FAA horizontal tolerance widens the point envelope; unknown accuracy is not replaced with an invented value. Overlapping conflicts are dissolved into one layer.</p><p><b>This model will never be fully accurate or complete.</b> Airspace, temporary restrictions, weather, routes, takeoff/landing exceptions, and §91.119(a)/(c)/(d) are not modeled.</p></div>}
+            {detailsOpen && <div className="model-details"><p>Red geometry combines conservative land/shoreline elevation cells with a 2,000-ft buffer around active Overture envelopes and FAA obstacle points. Confident open-water cells are omitted from the terrain mask, but modeled obstacles remain active. Overlapping conflicts are dissolved into one layer.</p><p><b>This model will never be fully accurate or complete.</b> Airspace, temporary restrictions, weather, vessels, people, vehicles, routes, takeoff/landing exceptions, and §91.119(a)/(c)/(d) conditions are not fully modeled.</p></div>}
           </div>
         </aside>
 
@@ -2192,7 +2354,7 @@ export function AirspacePlanner() {
               </div>
               <div className={`render-progress-track ${renderProgress.active ? "" : "indeterminate"}`} aria-hidden="true"><i style={renderProgress.active ? { width: `${Math.max(0, Math.min(100, renderProgress.value))}%` } : undefined} /></div>
               <p>{renderProgress.active
-                ? "Buildings, FAA obstacles, and terrain are being screened. The completed overlay will stay on the map until you re-render."
+                ? "Buildings, FAA obstacles, terrain, and open-water coverage are being screened. The completed overlay will stay on the map until you re-render."
                 : "Recalculating obstacle and terrain conflicts for the selected altitude. The map will be available when the boundaries are ready."}</p>
             </div>
           </div>}
@@ -2212,13 +2374,14 @@ export function AirspacePlanner() {
           <span className="modal-kicker">MODEL NOTES</span>
           <h2 id="limitations-title">A conservative screen—not a complete or authoritative answer.</h2>
           <p><b>This model will never be fully accurate or complete.</b> It cannot establish legality, authorization, obstacle clearance, or safe flight. Always use current official aeronautical sources and independent preflight judgment.</p>
-          <p>The aircraft altitude is modeled in feet MSL. Required altitude is the greatest of bare-earth surface elevation plus 1,000 feet, a nearby building top plus 1,000 feet, or an FAA-listed obstacle top plus 1,000 feet.</p>
+          <p>The aircraft altitude is modeled in feet MSL. Over land and uncertain shoreline cells, required altitude is the greatest of surface elevation plus 1,000 feet, a nearby building top plus 1,000 feet, or an FAA-listed obstacle top plus 1,000 feet. Confident open-water cells do not create a surface-elevation minimum.</p>
           <p>GeoJSON Polygon and MultiPolygon outer footprints are preserved. The building conflict geometry begins at the closest footprint edge and buffers it by 2,000 feet.</p>
           <p>Overture parent buildings marked <code>has_parts</code> remain as the complete outer envelope. Parts are linked through <code>building_id</code> and retained only when they add a higher modeled top, extend outside the parent, or have no loaded parent. Floating-part tops include <code>min_height</code> or estimated <code>min_floor</code>.</p>
           <p>FAA Daily DOF records are points, not surveyed footprints. The model now uses the published AMSL value exactly; vertical accuracy is displayed as metadata and is not added to the obstacle height. Known horizontal tolerance widens the point envelope before the 2,000-ft buffer is applied. Unknown horizontal or vertical accuracy remains explicitly unknown rather than receiving a synthetic default.</p>
           <p>The FAA file includes both verified and unverified obstacles. Both are modeled; unverified values are explicitly unreliable, and the FAA states that the file does not contain every obstruction that may be encountered.</p>
           <p>When more than 500 obstacles are active in the rendered area, nearby envelopes are conservatively grouped for the red overlay so the altitude control stays responsive. The selected-point check still tests the individual building envelopes.</p>
-          <p>Terrain tiles are divided into 64×64-pixel cells. Each cell uses its highest DEM pixel, so the surface screen is intentionally conservative. DEM elevations are planning data, not surveyed obstacle or navigation values.</p>
+          <p>Terrain tiles are divided into 64×64-pixel cells. Each land or shoreline cell uses its highest DEM pixel. A cell is treated as open water only when a guarded sample grid is fully covered by permanent Overture ocean or inland-water polygons; uncertain and intermittent-water cells remain terrain.</p>
+          <p>Over open water, §91.119(c) does not prescribe a fixed height above the water surface, but it still restricts proximity to people, vessels, vehicles, and structures, and §91.119(a) still applies. This model preserves building and FAA-obstacle screening but does not know real-time vessel, vehicle, or person locations.</p>
           <p>Building and terrain evaluation use fixed full-detail tiles independent of camera zoom. Each render includes a 2,000-ft halo around the selected box so edge points can be checked; the selectable tile budget is currently {tileBudget} tiles.</p>
           <p>The rendered result remains fixed while you pan or zoom and changes only when you press Re-render. The FAA evaluates whether an area is “congested” case by case, so the selected box is treated as a conservative study area—not labeled as an official FAA boundary.</p>
           <div className="modal-warning"><b>Small UAS note</b><span>Part 107 generally uses a different 400-foot AGL framework and may require airspace authorization. This prototype models the Part 91 rule named above.</span></div>
@@ -2233,12 +2396,17 @@ export function AirspacePlanner() {
             <a href="https://registry.opendata.aws/terrain-tiles/" target="_blank" rel="noreferrer">Open AWS terrain dataset ↗</a>
           </div>
           <div className="source-detail">
+            <h3>Open-water source: Overture Maps Base</h3>
+            <p>Permanent polygon features classified as ocean, lake, pond, reservoir, river, stream, water, or canal are used to identify confident open-water terrain cells. Human-made pools, wastewater, intermittent water, and uncertain shoreline cells are not excluded.</p>
+            <a href="https://docs.overturemaps.org/schema/reference/base/water/" target="_blank" rel="noreferrer">Open Overture water schema ↗</a>
+          </div>
+          <div className="source-detail">
             <h3>Known obstacle source: FAA Daily DOF</h3>
             <p>The bundled {faaObstacleSnapshot || "current"} snapshot contains the FAA’s known obstacles of interest to aviation, split into geographic shards so only the selected area and its halo load in the browser. The source is refreshed with <code>pnpm data:faa</code>.</p>
             <a href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/DailyDOF/" target="_blank" rel="noreferrer">Open FAA Daily DOF ↗</a>
           </div>
           <div className="file-help"><h3>Advanced local override</h3><p>GeoJSON: use <code>height_ft</code>, Overture <code>height</code> (meters), <code>height_m</code>, <code>num_floors</code>, or <code>building:levels</code>. Floating features may also provide <code>min_height</code> or <code>min_floor</code>. CSV: include <code>lat, lon, height_ft, width_ft, depth_ft</code>.</p><div className="file-actions"><button onClick={() => inputRef.current?.click()}>Import local file</button><button onClick={downloadTemplate}>Download CSV template</button>{sourceMode === "local" && <button onClick={activateOverture}>Return to Overture</button>}</div></div>
-          <div className="modal-links"><a href="https://www.faa.gov/about/office_org/headquarters_offices/agc/practice_areas/regulations/interpretations/Data/interps/2009/Anderson_2009_Legal_Interpretation.pdf" target="_blank" rel="noreferrer">FAA Anderson interpretation ↗</a><a href="https://www.usgs.gov/3d-elevation-program" target="_blank" rel="noreferrer">USGS 3DEP ↗</a><a href="https://carto.com/basemaps/" target="_blank" rel="noreferrer">Street basemap ↗</a><a href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/vfr/" target="_blank" rel="noreferrer">FAA chart sources ↗</a></div>
+          <div className="modal-links"><a href="https://www.faa.gov/about/office_org/field_offices/fsdo/anf" target="_blank" rel="noreferrer">FAA §91.119 overview ↗</a><a href="https://www.faa.gov/about/office_org/headquarters_offices/agc/practice_areas/regulations/interpretations/Data/interps/2009/Anderson_2009_Legal_Interpretation.pdf" target="_blank" rel="noreferrer">FAA Anderson interpretation ↗</a><a href="https://www.usgs.gov/3d-elevation-program" target="_blank" rel="noreferrer">USGS 3DEP ↗</a><a href="https://carto.com/basemaps/" target="_blank" rel="noreferrer">Street basemap ↗</a><a href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/vfr/" target="_blank" rel="noreferrer">FAA chart sources ↗</a></div>
         </section>
       </div>}
     </main>

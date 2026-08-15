@@ -31,6 +31,7 @@ type TerrainCell = {
   south: number;
   north: number;
   elevationFt: number;
+  openWater?: boolean;
 };
 type PrepareMessage = {
   type: "prepare";
@@ -62,6 +63,7 @@ let buildings: Building[] = [];
 let groupedBuildings: Building[] = [];
 let sortedBuildingThresholds: number[] = [];
 let screenedTerrainCells: TerrainCell[] = [];
+let hasOpenWaterCells = false;
 let zones: Zone[] = [];
 let origin: Origin = { lat: 0, lon: 0 };
 let renderedBounds: RenderBounds = { west: 0, east: 0, south: 0, north: 0 };
@@ -376,7 +378,7 @@ function computeConflicts(requestId: number, altitudeFt: number): ConflictResult
     });
   const activeTerrainCells = screenedTerrainCells
     .filter((cell) => altitudeFt < cell.elevationFt + 1000);
-  if (screenedTerrainCells.length > 0 && activeTerrainCells.length === screenedTerrainCells.length) {
+  if (!hasOpenWaterCells && screenedTerrainCells.length > 0 && activeTerrainCells.length === screenedTerrainCells.length) {
     postProgress(requestId, 0.9, "Surface mask covers the selected area");
     const conflicts = featureCollection(zoneFeatures);
     const areaSquareMeters = conflicts.features.reduce((sum, feature) => sum + featureArea(feature), 0);
@@ -429,7 +431,9 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
       zones = message.zones;
       origin = message.origin;
       renderedBounds = message.renderedBounds;
-      screenedTerrainCells = message.terrainCells.filter(terrainCellIntersectsBounds);
+      const renderedTerrainCells = message.terrainCells.filter(terrainCellIntersectsBounds);
+      hasOpenWaterCells = renderedTerrainCells.some((cell) => cell.openWater);
+      screenedTerrainCells = renderedTerrainCells.filter((cell) => !cell.openWater);
       zoneFeatures = zones.map(zoneFeature);
       bufferedBuildingCache.clear();
       buildingConflictBoundsCache.clear();
