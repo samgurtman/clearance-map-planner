@@ -90,7 +90,9 @@ const OVERTURE_CATALOG_URL = "https://stac.overturemaps.org/catalog.json";
 const FAA_SECTIONAL_TILE_URL = "https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer/tile/{z}/{y}/{x}";
 const FAA_TERMINAL_TILE_URL = "https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Terminal/MapServer/tile/{z}/{y}/{x}";
 const TERRAIN_TILE_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
-const FAA_OBSTACLE_DATA_ROOT = "/data/faa-obstacles";
+// Relative to the document so repository-scoped GitHub Pages URLs keep the
+// bundled FAA shards under the same base path.
+const FAA_OBSTACLE_DATA_ROOT = "./data/faa-obstacles";
 const TERRAIN_TILE_ZOOM = 14;
 const TERRAIN_CELL_DIVISIONS = 4;
 const WATER_TILE_ZOOM = 10;
