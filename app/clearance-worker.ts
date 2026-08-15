@@ -57,7 +57,7 @@ const RESULT_CACHE_SIZE = 12;
 
 let buildings: Building[] = [];
 let groupedBuildings: Building[] = [];
-let terrainCells: TerrainCell[] = [];
+let screenedTerrainCells: TerrainCell[] = [];
 let zones: Zone[] = [];
 let origin: Origin = { lat: 0, lon: 0 };
 let renderedBounds: RenderBounds = { west: 0, east: 0, south: 0, north: 0 };
@@ -196,6 +196,31 @@ function compactTerrainFeatures(activeCells: TerrainCell[]) {
   return features;
 }
 
+type CoordinateBounds = { west: number; east: number; south: number; north: number };
+
+function featureBounds(feature: Feature<Polygon | MultiPolygon>): CoordinateBounds {
+  const polygons = feature.geometry.type === "Polygon"
+    ? [feature.geometry.coordinates]
+    : feature.geometry.coordinates;
+  const bounds = { west: Infinity, east: -Infinity, south: Infinity, north: -Infinity };
+  polygons.forEach((rings) => rings.forEach((ring) => ring.forEach(([longitude, latitude]) => {
+    bounds.west = Math.min(bounds.west, longitude);
+    bounds.east = Math.max(bounds.east, longitude);
+    bounds.south = Math.min(bounds.south, latitude);
+    bounds.north = Math.max(bounds.north, latitude);
+  })));
+  return bounds;
+}
+
+function featureCoveredByTerrain(feature: Feature<Polygon | MultiPolygon>, terrainBounds: CoordinateBounds[]) {
+  const bounds = featureBounds(feature);
+  const tolerance = 1e-10;
+  return terrainBounds.some((terrain) => bounds.west >= terrain.west - tolerance
+    && bounds.east <= terrain.east + tolerance
+    && bounds.south >= terrain.south - tolerance
+    && bounds.north <= terrain.north + tolerance);
+}
+
 function bufferedConflictFeature(building: Building) {
   const cached = bufferedBuildingCache.get(building.id);
   if (cached !== undefined) return cached;
@@ -286,18 +311,36 @@ function computeConflicts(requestId: number, altitudeFt: number): ConflictResult
       return topElevationFt != null && altitudeFt < topElevationFt + 1000;
     })
     : activeBuildings;
-  const activeTerrainCells = terrainCells
-    .filter((cell) => terrainCellIntersectsBounds(cell) && altitudeFt < cell.elevationFt + 1000);
-  const features: Array<Feature<Polygon | MultiPolygon>> = compactTerrainFeatures(activeTerrainCells);
+  const activeTerrainCells = screenedTerrainCells
+    .filter((cell) => altitudeFt < cell.elevationFt + 1000);
+  if (screenedTerrainCells.length > 0 && activeTerrainCells.length === screenedTerrainCells.length) {
+    postProgress(requestId, 0.9, "Surface mask covers the selected area");
+    const conflicts = featureCollection(zoneFeatures);
+    const areaSquareMeters = conflicts.features.reduce((sum, feature) => sum + featureArea(feature), 0);
+    const result = {
+      conflicts,
+      activeObstacles: activeBuildings.length,
+      flaggedSquareMiles: areaSquareMeters / SQUARE_METERS_PER_SQUARE_MILE,
+    };
+    rememberResult(altitudeFt, result);
+    return result;
+  }
+  const terrainFeatures = compactTerrainFeatures(activeTerrainCells);
+  const terrainBounds = terrainFeatures.map(featureBounds);
+  const buildingFeatures: Array<Feature<Polygon | MultiPolygon>> = [];
 
   postProgress(requestId, 0.35, "Preparing building clearance envelopes");
   displayBuildings.forEach((building) => {
     const feature = bufferedConflictFeature(building);
-    if (feature) features.push(feature);
+    if (feature && !featureCoveredByTerrain(feature, terrainBounds)) buildingFeatures.push(feature);
   });
 
   postProgress(requestId, 0.72, "Dissolving overlap into one shade");
-  const conflicts = dissolveFeatures(features);
+  const terrainMask = dissolveFeatures(terrainFeatures);
+  const buildingMask = dissolveFeatures(buildingFeatures);
+  const conflicts = terrainMask.features.length && buildingMask.features.length
+    ? dissolveFeatures([...terrainMask.features, ...buildingMask.features])
+    : terrainMask.features.length ? terrainMask : buildingMask;
   const areaSquareMeters = conflicts.features.reduce((sum, feature) => sum + featureArea(feature), 0);
   const result = {
     conflicts,
@@ -315,10 +358,10 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
     if (message.type === "prepare") {
       buildings = message.buildings;
       groupedBuildings = buildings.length > 500 ? groupDenseBuildings(buildings) : [];
-      terrainCells = message.terrainCells;
       zones = message.zones;
       origin = message.origin;
       renderedBounds = message.renderedBounds;
+      screenedTerrainCells = message.terrainCells.filter(terrainCellIntersectsBounds);
       zoneFeatures = zones.map(zoneFeature);
       bufferedBuildingCache.clear();
       resultCache.clear();
