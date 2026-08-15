@@ -183,6 +183,7 @@ button { color: inherit; }
 .legend-amber { background: rgba(182,132,39,.15); border: 1px dashed var(--amber); }
 .legend-blue { background: rgba(39,111,158,.12); border: 1px dashed #276f9e; }
 .legend-building { background: #4f595e; }
+.legend-faa { background: #72231d; border: 2px solid #fffdf7; border-radius: 50%; box-shadow: 0 0 0 1px #72231d; }
 .dataset-card { position: absolute; z-index: 2; left: 18px; bottom: 23px; width: min(360px, calc(100% - 36px)); display: flex; align-items: center; gap: 11px; padding: 12px; background: rgba(255,253,247,.94); border: 1px solid rgba(24,34,41,.18); box-shadow: 0 8px 24px rgba(38,42,42,.1); }
 .dataset-icon { width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid var(--line); font-size: 15px; }
 .dataset-card > span:nth-child(2) { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
@@ -200,7 +201,7 @@ button { color: inherit; }
 .national-source strong { font-size: 11px; }
 .national-source strong b { color: var(--signal); }
 .national-source > span:last-child { color: #6f777a; font-size: 8px; line-height: 1.45; }
-.terrain-source { margin-top: 8px; }
+.terrain-source, .faa-source { margin-top: 8px; }
 
 .legal-bar { min-height: 34px; flex: 0 0 34px; display: flex; align-items: center; justify-content: center; gap: 13px; padding: 4px 18px; background: var(--ink); color: #cfd4d5; font-size: 8px; letter-spacing: .03em; text-align: center; }
 .legal-bar b { color: white; margin-right: 5px; }

@@ -14,6 +14,8 @@ type Building = Point & {
   heightFt: number;
   heightSource: string;
   groundElevationFt?: number;
+  topElevationFt?: number;
+  sourceKind?: "building" | "faa-obstacle";
 };
 type Zone = { id: string; label: string; points: Point[]; source: string };
 type RenderBounds = { west: number; east: number; south: number; north: number };
@@ -108,6 +110,7 @@ function rectangleEnvelope(x: number, y: number, width: number, depth: number): 
 }
 
 function buildingTopElevationFt(building: Building) {
+  if (building.topElevationFt != null) return building.topElevationFt;
   return building.groundElevationFt == null ? null : building.groundElevationFt + building.heightFt;
 }
 
@@ -145,6 +148,7 @@ function groupDenseBuildings(allBuildings: Building[], cellSize = 750): Building
       envelopes: [rectangleEnvelope(x, y, width, depth)],
       heightFt: group.heightFt,
       groundElevationFt: group.groundElevationFt,
+      topElevationFt: group.topElevationFt,
       heightSource: "Dense-view group",
     };
   }).sort((a, b) => a.y - b.y || a.x - b.x);
@@ -388,7 +392,7 @@ function computeConflicts(requestId: number, altitudeFt: number): ConflictResult
   const terrainBounds = terrainFeatures.map(featureBounds);
   const buildingFeatures: Array<Feature<Polygon | MultiPolygon>> = [];
 
-  postProgress(requestId, 0.35, "Preparing building clearance envelopes");
+  postProgress(requestId, 0.35, "Preparing building and FAA obstacle envelopes");
   displayBuildings.forEach((building) => {
     if (boundsCoveredByTerrain(buildingConflictBounds(building), terrainBounds)) return;
     const feature = bufferedConflictFeature(building);
