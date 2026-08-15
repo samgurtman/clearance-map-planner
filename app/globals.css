@@ -154,6 +154,13 @@ button { color: inherit; }
 .render-toolbar-copy { display: flex; flex-direction: column; gap: 4px; }
 .render-toolbar-copy small { color: #858b8d; font-size: 7px; font-weight: 900; letter-spacing: .14em; }
 .render-toolbar-copy strong { font-size: 10px; line-height: 1.35; }
+.tile-budget-control { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 7px 12px; margin-top: 11px; padding-top: 10px; border-top: 1px solid rgba(70,74,75,.12); }
+.tile-budget-control > span { display: flex; flex-direction: column; gap: 3px; min-width: 78px; }
+.tile-budget-control small { color: #858b8d; font-size: 7px; font-weight: 900; letter-spacing: .1em; }
+.tile-budget-control strong { font-size: 15px; line-height: 1; }
+.tile-budget-control input { width: 100%; accent-color: var(--signal); cursor: ew-resize; }
+.tile-budget-control input:disabled { cursor: wait; opacity: .5; }
+.tile-budget-control em { grid-column: 2; display: flex; justify-content: space-between; margin-top: -5px; color: #858b8d; font-size: 7px; font-style: normal; }
 .render-actions { display: grid; grid-template-columns: 1fr 1fr 1.1fr; gap: 6px; margin-top: 10px; }
 .render-actions button { min-height: 32px; padding: 0 8px; border: 1px solid #bcc0be; background: #f8f6ef; color: #4f595d; font-size: 8px; font-weight: 900; letter-spacing: .05em; text-transform: uppercase; cursor: pointer; }
 .render-actions button:hover:not(:disabled), .render-actions button.active { border-color: #276f9e; color: #1c5b84; background: #edf5fa; }

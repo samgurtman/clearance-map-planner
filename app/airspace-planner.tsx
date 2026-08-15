@@ -94,7 +94,9 @@ const OVERTURE_MEMORY_CACHE_MAX_TILES = 48;
 const OVERTURE_MEMORY_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 const OVERTURE_PERSISTENT_CACHE_MAX_TILES = 256;
 const OVERTURE_PERSISTENT_CACHE_MAX_BYTES = 256 * 1024 * 1024;
-const MAX_VISIBLE_OVERTURE_TILES = 128;
+const MIN_TILE_BUDGET = 32;
+const MAX_TILE_BUDGET = 256;
+const DEFAULT_TILE_BUDGET = 256;
 const CLEARANCE_DISTANCE_FT = 2000;
 const FAA_MAX_HORIZONTAL_ACCURACY_FT = 6076;
 const CLEARANCE_WORKER_TIMEOUT_MS = 75_000;
@@ -956,6 +958,7 @@ export function AirspacePlanner() {
   const invalidateModelRef = useRef<() => void>(() => undefined);
   const workerModelReadyRef = useRef(false);
   const renderedAltitudeRef = useRef<number | null>(null);
+  const tileBudgetRef = useRef(DEFAULT_TILE_BUDGET);
   const drawingAreaRef = useRef(false);
   const selectionStartRef = useRef<[number, number] | null>(null);
   const coverageBoundsRef = useRef<{ west: number; east: number; south: number; north: number } | null>(null);
@@ -970,6 +973,7 @@ export function AirspacePlanner() {
   const loadedOriginDataRef = useRef<Origin>(CHICAGO_ORIGIN);
   const liveDataRef = useRef({ altitudeFt: 1800, buildings: [] as Building[], zones: [] as Zone[], origin: CHICAGO_ORIGIN, sourceMode: "overture" as "overture" | "local" });
   const [altitudeFt, setAltitudeFt] = useState(1800);
+  const [tileBudget, setTileBudget] = useState(DEFAULT_TILE_BUDGET);
   const [buildings, setBuildings] = useState<Building[]>([]);
   const [zones, setZones] = useState<Zone[]>([]);
   const [origin, setOrigin] = useState<Origin>(CHICAGO_ORIGIN);
@@ -1309,10 +1313,11 @@ export function AirspacePlanner() {
         const minY = Math.max(0, Math.min(maxTile, tileY(requiredCoverage.north, TERRAIN_TILE_ZOOM)));
         const maxY = Math.max(0, Math.min(maxTile, tileY(requiredCoverage.south, TERRAIN_TILE_ZOOM)));
         const visibleTileCount = (maxX - minX + 1) * (maxY - minY + 1);
-        if (visibleTileCount <= 0 || visibleTileCount > MAX_VISIBLE_OVERTURE_TILES) {
+        const activeTileBudget = tileBudgetRef.current;
+        if (visibleTileCount <= 0 || visibleTileCount > activeTileBudget) {
           clearTerrain();
           setTerrainStatus("zoom-required");
-          setTerrainNote(`Selected area spans ${visibleTileCount.toLocaleString()} elevation tiles · select an area using ${MAX_VISIBLE_OVERTURE_TILES} or fewer`);
+          setTerrainNote(`Selected area spans ${visibleTileCount.toLocaleString()} elevation tiles · select an area using ${activeTileBudget} or fewer`);
           return null;
         }
         const coordinates: Array<{ x: number; y: number }> = [];
@@ -1431,10 +1436,11 @@ export function AirspacePlanner() {
         const minY = Math.max(0, Math.min(maxTile, tileY(requiredCoverage.north, zoom)));
         const maxY = Math.max(0, Math.min(maxTile, tileY(requiredCoverage.south, zoom)));
         const visibleTileCount = (maxX - minX + 1) * (maxY - minY + 1);
-        if (visibleTileCount <= 0 || visibleTileCount > MAX_VISIBLE_OVERTURE_TILES) {
+        const activeTileBudget = tileBudgetRef.current;
+        if (visibleTileCount <= 0 || visibleTileCount > activeTileBudget) {
           clearCoverage();
           setCoverageStatus("zoom-required");
-          setDataNote(`Selected area plus the 2,000-ft clearance halo spans ${visibleTileCount.toLocaleString()} full-detail tiles · select an area using ${MAX_VISIBLE_OVERTURE_TILES} or fewer`);
+          setDataNote(`Selected area plus the 2,000-ft clearance halo spans ${visibleTileCount.toLocaleString()} full-detail tiles · select an area using ${activeTileBudget} or fewer`);
           return null;
         }
         const coordinates: Array<{ x: number; y: number }> = [];
@@ -2052,9 +2058,9 @@ export function AirspacePlanner() {
     : !renderedBounds && coverageStatus === "idle" && terrainStatus === "idle"
       ? "Select an area on the map and press Render. The completed clearance result will remain fixed while you pan or zoom."
     : coverageStatus === "zoom-required"
-    ? `The selected area and its 2,000-ft clearance halo exceed the ${MAX_VISIBLE_OVERTURE_TILES}-tile full-detail budget. Select a smaller area to evaluate clearance.`
+    ? `The selected area and its 2,000-ft clearance halo exceed the ${tileBudget}-tile full-detail budget. Increase the budget or select a smaller area.`
     : terrainStatus === "zoom-required"
-      ? `Surface coverage exceeds the ${MAX_VISIBLE_OVERTURE_TILES}-tile elevation budget. Select a smaller area to evaluate terrain clearance.`
+      ? `Surface coverage exceeds the ${tileBudget}-tile elevation budget. Increase the budget or select a smaller area.`
       : terrainStatus === "loading"
         ? "Bare-earth surface elevations must load before clearance can be evaluated."
       : terrainStatus === "error"
@@ -2152,6 +2158,24 @@ export function AirspacePlanner() {
           </div>
           <section className="render-toolbar" aria-label="Render area controls">
             <div className="render-toolbar-copy"><small>RENDER AREA</small><strong>{selectionLabel}</strong></div>
+            <label className="tile-budget-control">
+              <span><small>FULL-DETAIL TILE BUDGET</small><strong>{tileBudget}</strong></span>
+              <input
+                type="range"
+                min={MIN_TILE_BUDGET}
+                max={MAX_TILE_BUDGET}
+                step="32"
+                value={tileBudget}
+                disabled={renderProgress.active}
+                onChange={(event) => {
+                  const nextBudget = Number(event.target.value);
+                  tileBudgetRef.current = nextBudget;
+                  setTileBudget(nextBudget);
+                }}
+                aria-label="Full-detail building and elevation tile budget"
+              />
+              <em><b>{MIN_TILE_BUDGET}</b><b>{MAX_TILE_BUDGET}</b></em>
+            </label>
             <div className="render-actions">
               <button className={drawingArea ? "active" : ""} aria-pressed={drawingArea} onClick={beginAreaSelection}>{drawingArea ? "Cancel draw" : "Draw area"}</button>
               <button onClick={useCurrentView} disabled={!mapReady || renderProgress.active}>Use view</button>
@@ -2195,7 +2219,7 @@ export function AirspacePlanner() {
           <p>The FAA file includes both verified and unverified obstacles. Both are modeled; unverified values are explicitly unreliable, and the FAA states that the file does not contain every obstruction that may be encountered.</p>
           <p>When more than 500 obstacles are active in the rendered area, nearby envelopes are conservatively grouped for the red overlay so the altitude control stays responsive. The selected-point check still tests the individual building envelopes.</p>
           <p>Terrain tiles are divided into 64×64-pixel cells. Each cell uses its highest DEM pixel, so the surface screen is intentionally conservative. DEM elevations are planning data, not surveyed obstacle or navigation values.</p>
-          <p>Building and terrain evaluation use fixed full-detail tiles independent of camera zoom. Each render includes a 2,000-ft halo around the selected box so edge points can be checked; selections spanning more than {MAX_VISIBLE_OVERTURE_TILES} tiles are explicitly not evaluated.</p>
+          <p>Building and terrain evaluation use fixed full-detail tiles independent of camera zoom. Each render includes a 2,000-ft halo around the selected box so edge points can be checked; the selectable tile budget is currently {tileBudget} tiles.</p>
           <p>The rendered result remains fixed while you pan or zoom and changes only when you press Re-render. The FAA evaluates whether an area is “congested” case by case, so the selected box is treated as a conservative study area—not labeled as an official FAA boundary.</p>
           <div className="modal-warning"><b>Small UAS note</b><span>Part 107 generally uses a different 400-foot AGL framework and may require airspace authorization. This prototype models the Part 91 rule named above.</span></div>
           <div className="source-detail">
