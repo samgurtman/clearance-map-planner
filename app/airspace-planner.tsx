@@ -21,6 +21,7 @@ type Building = Point & {
   envelopes: Point[][];
   heightFt: number;
   heightSource: string;
+  heightQuality?: "measured" | "estimated" | "fallback";
   groundElevationFt?: number;
   topElevationFt?: number;
   sourceKind?: "building" | "faa-obstacle";
@@ -632,13 +633,30 @@ function propertyName(properties: Record<string, unknown>, fallback: string) {
   return names?.primary || names?.common?.en || fallback;
 }
 
+function finiteProperty(value: unknown) {
+  return value !== null && value !== "" && Number.isFinite(Number(value));
+}
+
 function propertyHeight(properties: Record<string, unknown>) {
-  if (Number.isFinite(Number(properties.height_ft))) return { feet: Number(properties.height_ft), source: "height_ft" };
-  if (Number.isFinite(Number(properties.height_m))) return { feet: Number(properties.height_m) * 3.28084, source: "height_m" };
-  if (Number.isFinite(Number(properties.height))) return { feet: Number(properties.height) * 3.28084, source: "height (meters)" };
-  if (Number.isFinite(Number(properties.num_floors))) return { feet: Number(properties.num_floors) * 10, source: "num_floors estimate" };
-  if (Number.isFinite(Number(properties["building:levels"]))) return { feet: Number(properties["building:levels"]) * 10, source: "building:levels estimate" };
-  return { feet: 30, source: "30 ft fallback" };
+  if (finiteProperty(properties.height_ft)) return { feet: Number(properties.height_ft), source: "height_ft", quality: "measured" as const };
+  if (finiteProperty(properties.height_m)) return { feet: Number(properties.height_m) * 3.28084, source: "height_m", quality: "measured" as const };
+  if (finiteProperty(properties.height)) return { feet: Number(properties.height) * 3.28084, source: "height (meters)", quality: "measured" as const };
+  if (finiteProperty(properties.num_floors)) return { feet: Number(properties.num_floors) * 10, source: "num_floors estimate", quality: "estimated" as const };
+  if (finiteProperty(properties["building:levels"])) return { feet: Number(properties["building:levels"]) * 10, source: "building:levels estimate", quality: "estimated" as const };
+  return { feet: 30, source: "30 ft fallback", quality: "fallback" as const };
+}
+
+function propertyTopHeight(properties: Record<string, unknown>) {
+  const height = propertyHeight(properties);
+  if (finiteProperty(properties.min_height) && Number(properties.min_height) > 0) {
+    const minimumHeightFt = Number(properties.min_height) * 3.28084;
+    return { ...height, feet: height.feet + minimumHeightFt, source: `${height.source} + min_height`, quality: height.quality === "fallback" ? "estimated" as const : height.quality };
+  }
+  if (finiteProperty(properties.min_floor) && Number(properties.min_floor) > 0) {
+    const minimumHeightFt = Number(properties.min_floor) * 10;
+    return { ...height, feet: height.feet + minimumHeightFt, source: `${height.source} + min_floor estimate`, quality: height.quality === "fallback" ? "estimated" as const : height.quality };
+  }
+  return height;
 }
 
 function parseCsv(text: string): ImportedDataset {
@@ -671,6 +689,7 @@ function parseCsv(text: string): ImportedDataset {
       envelopes: [rectangleEnvelope(center.x, center.y, width, depth)],
       heightFt,
       heightSource: "height_ft",
+      heightQuality: "measured" as const,
     };
   });
   return { buildings, origin, note: "CSV envelopes use width_ft × depth_ft rectangles" };
@@ -701,7 +720,7 @@ function parseGeoJson(text: string): ImportedDataset {
   };
   const buildings = raw.map((item) => {
     const properties = (item.feature.properties || {}) as Record<string, unknown>;
-    const height = propertyHeight(properties);
+    const height = propertyTopHeight(properties);
     const center = lngLatToLocal(item.lon, item.lat, origin);
     let envelopes = item.rings.map((ring) => ring.map(([lon, lat]) => lngLatToLocal(lon, lat, origin)));
     if (envelopes.length === 1 && envelopes[0].length === 1) envelopes = [rectangleEnvelope(center.x, center.y, Number(properties.width_ft) || 180, Number(properties.depth_ft) || 180)];
@@ -713,6 +732,7 @@ function parseGeoJson(text: string): ImportedDataset {
       envelopes,
       heightFt: Math.round(height.feet),
       heightSource: height.source,
+      heightQuality: height.quality,
     };
   });
   return { buildings, origin, note: "GeoJSON envelopes preserved · Overture height fields supported" };
@@ -726,14 +746,36 @@ function ringsFromOvertureFeature(feature: Feature<Polygon | MultiPolygon>): num
   return [];
 }
 
-function overtureBuildingsFromFeatures(features: Array<Feature<Polygon | MultiPolygon>>, origin: Origin): Building[] {
-  const records = new Map<string, Building>();
+type OvertureBuildingRecord = {
+  building: Building;
+  entityId: string;
+  parentBuildingId?: string;
+  sourceLayer: "building" | "building_part";
+};
+
+type OvertureBuildingReduction = {
+  buildings: Building[];
+  retainedFeatureKeys: Set<string>;
+  parentCount: number;
+  totalPartCount: number;
+  retainedPartCount: number;
+};
+
+function partExtendsOutsideParent(part: Building, parent: Building) {
+  return part.envelopes.some((partEnvelope) => partEnvelope.some((partPoint) => !parent.envelopes.some((parentEnvelope) => (
+    pointInPolygon(partPoint, parentEnvelope) || distanceToEnvelope(partPoint, parentEnvelope) <= 5
+  ))));
+}
+
+function overtureBuildingsFromFeatures(features: Array<Feature<Polygon | MultiPolygon>>, origin: Origin): OvertureBuildingReduction {
+  const records = new Map<string, OvertureBuildingRecord>();
   features.forEach((feature, index) => {
     const properties = (feature.properties || {}) as Record<string, unknown>;
-    const sourceLayer = String(properties.__sourceLayer || "building");
+    const sourceLayer = properties.__sourceLayer === "building_part" ? "building_part" : "building";
     const rings = ringsFromOvertureFeature(feature);
     if (!rings.length) return;
-    const key = `${sourceLayer}:${String(properties.id || feature.id || index)}`;
+    const entityId = String(properties.id || feature.id || index);
+    const key = `${sourceLayer}:${entityId}`;
     const envelopes = rings
       .map((ring) => ring.map(([lon, lat]) => lngLatToLocal(Number(lon), Number(lat), origin)))
       .map((envelope) => envelope.length > 2 && envelope[0].x === envelope[envelope.length - 1].x && envelope[0].y === envelope[envelope.length - 1].y ? envelope.slice(0, -1) : envelope)
@@ -741,23 +783,56 @@ function overtureBuildingsFromFeatures(features: Array<Feature<Polygon | MultiPo
     if (!envelopes.length) return;
     const existing = records.get(key);
     if (existing) {
-      existing.envelopes.push(...envelopes);
+      existing.building.envelopes.push(...envelopes);
       return;
     }
     const points = envelopes.flat();
-    const height = propertyHeight(properties);
+    const height = propertyTopHeight(properties);
     records.set(key, {
-      id: key,
-      name: propertyName(properties, sourceLayer === "building_part" ? "Building part" : "Building"),
-      x: points.reduce((sum, value) => sum + value.x, 0) / points.length,
-      y: points.reduce((sum, value) => sum + value.y, 0) / points.length,
-      envelopes,
-      heightFt: Math.round(height.feet),
-      heightSource: height.source,
-      sourceKind: "building",
+      entityId,
+      parentBuildingId: sourceLayer === "building_part" && properties.building_id ? String(properties.building_id) : undefined,
+      sourceLayer,
+      building: {
+        id: key,
+        name: propertyName(properties, sourceLayer === "building_part" ? "Building part" : "Building"),
+        x: points.reduce((sum, value) => sum + value.x, 0) / points.length,
+        y: points.reduce((sum, value) => sum + value.y, 0) / points.length,
+        envelopes,
+        heightFt: Math.round(height.feet),
+        heightSource: height.source,
+        heightQuality: height.quality,
+        sourceKind: "building",
+      },
     });
   });
-  return [...records.values()];
+  const values = [...records.values()];
+  const parentsById = new Map(values
+    .filter((record) => record.sourceLayer === "building")
+    .map((record) => [record.entityId, record]));
+  const retained: OvertureBuildingRecord[] = [];
+  values.forEach((record) => {
+    if (record.sourceLayer === "building") {
+      retained.push(record);
+      return;
+    }
+    const parent = record.parentBuildingId ? parentsById.get(record.parentBuildingId) : undefined;
+    if (!parent) {
+      retained.push(record);
+      return;
+    }
+    const partAddsHeight = record.building.heightQuality !== "fallback"
+      && (parent.building.heightQuality === "fallback" || record.building.heightFt > parent.building.heightFt + 1);
+    if (partAddsHeight || partExtendsOutsideParent(record.building, parent.building)) retained.push(record);
+  });
+  const totalPartCount = values.filter((record) => record.sourceLayer === "building_part").length;
+  const retainedPartCount = retained.filter((record) => record.sourceLayer === "building_part").length;
+  return {
+    buildings: retained.map((record) => record.building),
+    retainedFeatureKeys: new Set(retained.map((record) => `${record.sourceLayer}:${record.entityId}`)),
+    parentCount: values.length - totalPartCount,
+    totalPartCount,
+    retainedPartCount,
+  };
 }
 
 function tileX(lon: number, zoom: number) {
@@ -1411,9 +1486,10 @@ export function AirspacePlanner() {
                 const raw = (geojson.properties || {}) as Record<string, unknown>;
                 const isUnderground = raw.is_underground === true || raw.is_underground === "true";
                 if (isUnderground) continue;
-                const height = propertyHeight(raw);
+                const height = propertyTopHeight(raw);
                 geojson.properties = {
                   id: raw.id || vectorFeature.id || `${zoom}/${x}/${y}/${sourceLayer}/${index}`,
+                  building_id: raw.building_id,
                   name: raw.name,
                   "@name": raw["@name"],
                   names: raw.names,
@@ -1422,6 +1498,8 @@ export function AirspacePlanner() {
                   height_ft: raw.height_ft,
                   num_floors: raw.num_floors,
                   "building:levels": raw["building:levels"],
+                  min_height: raw.min_height,
+                  min_floor: raw.min_floor,
                   __sourceLayer: sourceLayer,
                   __renderHeightM: height.feet / 3.28084,
                 };
@@ -1439,9 +1517,14 @@ export function AirspacePlanner() {
             pendingTileKeyRef.current = null;
             return loadVisibleBuildingTiles(selection, onProgress);
           }
-          const nextBuildings = overtureBuildingsFromFeatures(decoded, nextOrigin);
-          const measured = nextBuildings.filter((building) => building.heightSource !== "30 ft fallback").length;
-          decoded.forEach((feature) => {
+          const reduction = overtureBuildingsFromFeatures(decoded, nextOrigin);
+          const nextBuildings = reduction.buildings;
+          const measured = nextBuildings.filter((building) => building.heightQuality !== "fallback").length;
+          const retainedDecoded = decoded.filter((feature) => {
+            const properties = feature.properties as Record<string, unknown>;
+            return reduction.retainedFeatureKeys.has(`${String(properties.__sourceLayer)}:${String(properties.id)}`);
+          });
+          retainedDecoded.forEach((feature) => {
             const properties = feature.properties as Record<string, unknown>;
             feature.properties = {
               id: properties.id,
@@ -1449,7 +1532,7 @@ export function AirspacePlanner() {
               __renderHeightM: properties.__renderHeightM,
             };
           });
-          source.setData(featureCollection(decoded));
+          source.setData(featureCollection(retainedDecoded));
           setOrigin(nextOrigin);
           loadedOriginDataRef.current = nextOrigin;
           loadedBuildingsDataRef.current = nextBuildings;
@@ -1462,7 +1545,7 @@ export function AirspacePlanner() {
           coverageBoundsRef.current = requiredCoverage;
           setCoverageStatus("ready");
           setDatasetName(`Overture Maps · ${requestRelease}`);
-          setDataNote(`${nextBuildings.length.toLocaleString()} selected-area envelopes · ${measured.toLocaleString()} with height/floor data · ${coordinates.length} full-detail z${zoom} tile${coordinates.length === 1 ? "" : "s"}`);
+          setDataNote(`${reduction.parentCount.toLocaleString()} parent envelopes + ${reduction.retainedPartCount.toLocaleString()} of ${reduction.totalPartCount.toLocaleString()} necessary parts · ${measured.toLocaleString()} with height/floor data · ${coordinates.length} full-detail z${zoom} tile${coordinates.length === 1 ? "" : "s"}`);
           onProgress?.(1);
           return { buildings: nextBuildings, origin: nextOrigin, zones: nextZones } satisfies BuildingLoadResult;
         } catch (error) {
@@ -2099,7 +2182,7 @@ export function AirspacePlanner() {
           <p><b>This model will never be fully accurate or complete.</b> It cannot establish legality, authorization, obstacle clearance, or safe flight. Always use current official aeronautical sources and independent preflight judgment.</p>
           <p>The aircraft altitude is modeled in feet MSL. Required altitude is the greatest of bare-earth surface elevation plus 1,000 feet, a nearby building top plus 1,000 feet, or an FAA-listed obstacle top plus 1,000 feet.</p>
           <p>GeoJSON Polygon and MultiPolygon outer footprints are preserved. The building conflict geometry begins at the closest footprint edge and buffers it by 2,000 feet.</p>
-          <p>Overture parent buildings marked <code>has_parts</code> remain in the model alongside their parts. This prevents a published parent height or uncovered part of the parent envelope from disappearing; overlap is dissolved in the final red layer.</p>
+          <p>Overture parent buildings marked <code>has_parts</code> remain as the complete outer envelope. Parts are linked through <code>building_id</code> and retained only when they add a higher modeled top, extend outside the parent, or have no loaded parent. Floating-part tops include <code>min_height</code> or estimated <code>min_floor</code>.</p>
           <p>FAA Daily DOF records are points, not surveyed footprints. Each point is expanded by its published horizontal accuracy tolerance and its AMSL top is increased by the published vertical tolerance before the 2,000-ft buffer is applied. Records with unknown accuracy use conservative 1-NM horizontal and 1,000-ft vertical defaults.</p>
           <p>The FAA file includes both verified and unverified obstacles. Both are modeled; unverified values are explicitly unreliable, and the FAA states that the file does not contain every obstruction that may be encountered.</p>
           <p>When more than 500 obstacles are active in the rendered area, nearby envelopes are conservatively grouped for the red overlay so the altitude control stays responsive. The selected-point check still tests the individual building envelopes.</p>
@@ -2109,7 +2192,7 @@ export function AirspacePlanner() {
           <div className="modal-warning"><b>Small UAS note</b><span>Part 107 generally uses a different 400-foot AGL framework and may require airspace authorization. This prototype models the Part 91 rule named above.</span></div>
           <div className="source-detail">
             <h3>Automatic national source: Overture Maps</h3>
-            <p>The map loads Overture’s official global Buildings PMTiles archive for the current release. Polygon/MultiPolygon footprints, building parts, and available height fields feed the clearance model wherever the selected box and its clearance halo fit within the full-detail tile budget.</p>
+            <p>The map loads Overture’s official global Buildings PMTiles archive for the current release. Polygon/MultiPolygon parent footprints are preserved, while redundant part geometry is removed after its parent relationship and top height are evaluated.</p>
             <a href="https://docs.overturemaps.org/guides/buildings/" target="_blank" rel="noreferrer">Open Overture Buildings guide ↗</a>
           </div>
           <div className="source-detail">
@@ -2122,7 +2205,7 @@ export function AirspacePlanner() {
             <p>The bundled {faaObstacleSnapshot || "current"} snapshot contains the FAA’s known obstacles of interest to aviation, split into geographic shards so only the selected area and its halo load in the browser. The source is refreshed with <code>pnpm data:faa</code>.</p>
             <a href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/DailyDOF/" target="_blank" rel="noreferrer">Open FAA Daily DOF ↗</a>
           </div>
-          <div className="file-help"><h3>Advanced local override</h3><p>GeoJSON: use <code>height_ft</code>, Overture <code>height</code> (meters), <code>height_m</code>, <code>num_floors</code>, or <code>building:levels</code>. CSV: include <code>lat, lon, height_ft, width_ft, depth_ft</code>.</p><div className="file-actions"><button onClick={() => inputRef.current?.click()}>Import local file</button><button onClick={downloadTemplate}>Download CSV template</button>{sourceMode === "local" && <button onClick={activateOverture}>Return to Overture</button>}</div></div>
+          <div className="file-help"><h3>Advanced local override</h3><p>GeoJSON: use <code>height_ft</code>, Overture <code>height</code> (meters), <code>height_m</code>, <code>num_floors</code>, or <code>building:levels</code>. Floating features may also provide <code>min_height</code> or <code>min_floor</code>. CSV: include <code>lat, lon, height_ft, width_ft, depth_ft</code>.</p><div className="file-actions"><button onClick={() => inputRef.current?.click()}>Import local file</button><button onClick={downloadTemplate}>Download CSV template</button>{sourceMode === "local" && <button onClick={activateOverture}>Return to Overture</button>}</div></div>
           <div className="modal-links"><a href="https://www.faa.gov/about/office_org/headquarters_offices/agc/practice_areas/regulations/interpretations/Data/interps/2009/Anderson_2009_Legal_Interpretation.pdf" target="_blank" rel="noreferrer">FAA Anderson interpretation ↗</a><a href="https://www.usgs.gov/3d-elevation-program" target="_blank" rel="noreferrer">USGS 3DEP ↗</a><a href="https://carto.com/basemaps/" target="_blank" rel="noreferrer">Street basemap ↗</a><a href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/vfr/" target="_blank" rel="noreferrer">FAA chart sources ↗</a></div>
         </section>
       </div>}
