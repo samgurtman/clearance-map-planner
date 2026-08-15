@@ -54,15 +54,18 @@ const FEET_PER_LAT_DEGREE = 364_000;
 const EARTH_RADIUS_METERS = 6_371_008.8;
 const SQUARE_METERS_PER_SQUARE_MILE = 2_589_988.110336;
 const RESULT_CACHE_SIZE = 12;
+const UNION_BATCH_SIZE = 48;
 
 let buildings: Building[] = [];
 let groupedBuildings: Building[] = [];
+let sortedBuildingThresholds: number[] = [];
 let screenedTerrainCells: TerrainCell[] = [];
 let zones: Zone[] = [];
 let origin: Origin = { lat: 0, lon: 0 };
 let renderedBounds: RenderBounds = { west: 0, east: 0, south: 0, north: 0 };
 let zoneFeatures: Array<Feature<Polygon>> = [];
 const bufferedBuildingCache = new Map<string, Feature<Polygon | MultiPolygon> | null>();
+const buildingConflictBoundsCache = new Map<string, CoordinateBounds>();
 const resultCache = new Map<number, ConflictResult>();
 
 const feetPerLonDegree = (latitude: number) => 364_000 * Math.cos((latitude * Math.PI) / 180);
@@ -144,7 +147,7 @@ function groupDenseBuildings(allBuildings: Building[], cellSize = 750): Building
       groundElevationFt: group.groundElevationFt,
       heightSource: "Dense-view group",
     };
-  });
+  }).sort((a, b) => a.y - b.y || a.x - b.x);
 }
 
 function terrainCellIntersectsBounds(cell: TerrainCell) {
@@ -214,11 +217,43 @@ function featureBounds(feature: Feature<Polygon | MultiPolygon>): CoordinateBoun
 
 function featureCoveredByTerrain(feature: Feature<Polygon | MultiPolygon>, terrainBounds: CoordinateBounds[]) {
   const bounds = featureBounds(feature);
+  return boundsCoveredByTerrain(bounds, terrainBounds);
+}
+
+function boundsCoveredByTerrain(bounds: CoordinateBounds, terrainBounds: CoordinateBounds[]) {
   const tolerance = 1e-10;
   return terrainBounds.some((terrain) => bounds.west >= terrain.west - tolerance
     && bounds.east <= terrain.east + tolerance
     && bounds.south >= terrain.south - tolerance
     && bounds.north <= terrain.north + tolerance);
+}
+
+function buildingConflictBounds(building: Building): CoordinateBounds {
+  const cached = buildingConflictBoundsCache.get(building.id);
+  if (cached) return cached;
+  const padding = CLEARANCE_DISTANCE_FT * 1.05 + 5;
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  building.envelopes.forEach((envelope) => envelope.forEach((value) => {
+    minX = Math.min(minX, value.x);
+    maxX = Math.max(maxX, value.x);
+    minY = Math.min(minY, value.y);
+    maxY = Math.max(maxY, value.y);
+  }));
+  minX -= padding;
+  maxX += padding;
+  minY -= padding;
+  maxY += padding;
+  const bounds = {
+    west: localToLngLat({ x: minX, y: 0 })[0],
+    east: localToLngLat({ x: maxX, y: 0 })[0],
+    north: localToLngLat({ x: 0, y: minY })[1],
+    south: localToLngLat({ x: 0, y: maxY })[1],
+  };
+  buildingConflictBoundsCache.set(building.id, bounds);
+  return bounds;
 }
 
 function bufferedConflictFeature(building: Building) {
@@ -244,13 +279,37 @@ function bufferedConflictFeature(building: Building) {
   return feature;
 }
 
-function dissolveFeatures(features: Array<Feature<Polygon | MultiPolygon>>): FeatureCollection<Polygon | MultiPolygon> {
+function dissolveFeatureBatch(features: Array<Feature<Polygon | MultiPolygon>>): FeatureCollection<Polygon | MultiPolygon> {
   if (features.length < 2) return featureCollection(features);
   const geometries = features.map((feature) => feature.geometry.coordinates as Geom);
   const coordinates = unionPolygons(geometries[0], ...geometries.slice(1));
   return coordinates.length
     ? featureCollection([multiPolygon(coordinates, { dissolved: true })])
     : featureCollection([]);
+}
+
+function dissolveFeatures(features: Array<Feature<Polygon | MultiPolygon>>): FeatureCollection<Polygon | MultiPolygon> {
+  if (features.length <= UNION_BATCH_SIZE) return dissolveFeatureBatch(features);
+  let current = features;
+  while (current.length > UNION_BATCH_SIZE) {
+    const next: Array<Feature<Polygon | MultiPolygon>> = [];
+    for (let index = 0; index < current.length; index += UNION_BATCH_SIZE) {
+      next.push(...dissolveFeatureBatch(current.slice(index, index + UNION_BATCH_SIZE)).features);
+    }
+    current = next;
+  }
+  return dissolveFeatureBatch(current);
+}
+
+function activeBuildingCount(altitudeFt: number) {
+  let low = 0;
+  let high = sortedBuildingThresholds.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (sortedBuildingThresholds[middle] <= altitudeFt) low = middle + 1;
+    else high = middle;
+  }
+  return sortedBuildingThresholds.length - low;
 }
 
 function ringArea(coordinates: number[][]) {
@@ -301,16 +360,16 @@ function computeConflicts(requestId: number, altitudeFt: number): ConflictResult
   }
 
   postProgress(requestId, 0.1, "Selecting active surfaces");
-  const activeBuildings = buildings.filter((building) => {
-    const topElevationFt = buildingTopElevationFt(building);
-    return topElevationFt != null && altitudeFt < topElevationFt + 1000;
-  });
-  const displayBuildings = activeBuildings.length > 500
+  const activeObstacles = activeBuildingCount(altitudeFt);
+  const displayBuildings = activeObstacles > 500
     ? groupedBuildings.filter((building) => {
       const topElevationFt = buildingTopElevationFt(building);
       return topElevationFt != null && altitudeFt < topElevationFt + 1000;
     })
-    : activeBuildings;
+    : buildings.filter((building) => {
+      const topElevationFt = buildingTopElevationFt(building);
+      return topElevationFt != null && altitudeFt < topElevationFt + 1000;
+    });
   const activeTerrainCells = screenedTerrainCells
     .filter((cell) => altitudeFt < cell.elevationFt + 1000);
   if (screenedTerrainCells.length > 0 && activeTerrainCells.length === screenedTerrainCells.length) {
@@ -319,7 +378,7 @@ function computeConflicts(requestId: number, altitudeFt: number): ConflictResult
     const areaSquareMeters = conflicts.features.reduce((sum, feature) => sum + featureArea(feature), 0);
     const result = {
       conflicts,
-      activeObstacles: activeBuildings.length,
+      activeObstacles,
       flaggedSquareMiles: areaSquareMeters / SQUARE_METERS_PER_SQUARE_MILE,
     };
     rememberResult(altitudeFt, result);
@@ -331,6 +390,7 @@ function computeConflicts(requestId: number, altitudeFt: number): ConflictResult
 
   postProgress(requestId, 0.35, "Preparing building clearance envelopes");
   displayBuildings.forEach((building) => {
+    if (boundsCoveredByTerrain(buildingConflictBounds(building), terrainBounds)) return;
     const feature = bufferedConflictFeature(building);
     if (feature && !featureCoveredByTerrain(feature, terrainBounds)) buildingFeatures.push(feature);
   });
@@ -344,7 +404,7 @@ function computeConflicts(requestId: number, altitudeFt: number): ConflictResult
   const areaSquareMeters = conflicts.features.reduce((sum, feature) => sum + featureArea(feature), 0);
   const result = {
     conflicts,
-    activeObstacles: activeBuildings.length,
+    activeObstacles,
     flaggedSquareMiles: areaSquareMeters / SQUARE_METERS_PER_SQUARE_MILE,
   };
   rememberResult(altitudeFt, result);
@@ -358,12 +418,17 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
     if (message.type === "prepare") {
       buildings = message.buildings;
       groupedBuildings = buildings.length > 500 ? groupDenseBuildings(buildings) : [];
+      sortedBuildingThresholds = buildings.flatMap((building) => {
+        const topElevationFt = buildingTopElevationFt(building);
+        return topElevationFt == null ? [] : [topElevationFt + 1000];
+      }).sort((a, b) => a - b);
       zones = message.zones;
       origin = message.origin;
       renderedBounds = message.renderedBounds;
       screenedTerrainCells = message.terrainCells.filter(terrainCellIntersectsBounds);
       zoneFeatures = zones.map(zoneFeature);
       bufferedBuildingCache.clear();
+      buildingConflictBoundsCache.clear();
       resultCache.clear();
     }
     const result = computeConflicts(message.requestId, message.altitudeFt);
