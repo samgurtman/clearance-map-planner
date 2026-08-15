@@ -1859,13 +1859,19 @@ export function AirspacePlanner() {
               <button className="render-primary" onClick={renderSelectedArea} disabled={!selectionIsValid || renderProgress.active}>{renderedBounds ? "Re-render" : "Render"}</button>
             </div>
             {renderedBounds && !renderProgress.active && <p className="render-persisted"><i />Rendered result is fixed until you press Re-render.</p>}
-            {overlayUpdating && !renderProgress.active && <p className="render-updating" role="status"><i />Updating red clearance geometry…</p>}
             {renderError && <p className="render-error" role="alert">{renderError}</p>}
           </section>
-          {renderProgress.active && <div className="render-progress" role="status" aria-live="polite">
-            <div className="render-progress-copy"><span><small>RENDERING SELECTED AREA</small><strong>{renderProgress.label}</strong></span><em>{Math.round(renderProgress.value)}%</em></div>
-            <div className="render-progress-track" aria-hidden="true"><i style={{ width: `${Math.max(0, Math.min(100, renderProgress.value))}%` }} /></div>
-            <p>Buildings and terrain are being screened. The completed overlay will stay on the map until you re-render.</p>
+          {(renderProgress.active || overlayUpdating) && <div className="map-processing-overlay" role="status" aria-live="polite" aria-busy="true">
+            <div className="render-progress">
+              <div className="render-progress-copy">
+                <span><small>{renderProgress.active ? "RENDERING SELECTED AREA" : "UPDATING CLEARANCE"}</small><strong>{renderProgress.active ? renderProgress.label : "Updating red boundaries"}</strong></span>
+                {renderProgress.active ? <em>{Math.round(renderProgress.value)}%</em> : <span className="render-progress-spinner" aria-hidden="true" />}
+              </div>
+              <div className={`render-progress-track ${renderProgress.active ? "" : "indeterminate"}`} aria-hidden="true"><i style={renderProgress.active ? { width: `${Math.max(0, Math.min(100, renderProgress.value))}%` } : undefined} /></div>
+              <p>{renderProgress.active
+                ? "Buildings and terrain are being screened. The completed overlay will stay on the map until you re-render."
+                : "Recalculating building and terrain conflicts for the selected altitude. The map will be available when the boundaries are ready."}</p>
+            </div>
           </div>}
           <div className="legend" aria-label="Map legend"><span><i className="legend-red" />Clearance conflict</span><span><i className="legend-amber" />Rendered area</span><span><i className="legend-blue" />Selection</span><span><i className="legend-building" />Building</span></div>
           <div className="dataset-card"><span className="dataset-icon" aria-hidden="true">▤</span><span><small>{sourceMode === "overture" ? "AUTOMATIC MODEL LAYERS" : "LOCAL BUILDINGS + TERRAIN"}</small><strong>{datasetName}</strong><em>{dataNote}</em><em>{terrainNote}</em></span>{sourceMode === "local" ? <button onClick={activateOverture}>Use Overture</button> : <span className={`data-live ${modelAvailable ? "" : "paused"}`}>{overlayUpdating ? "UPDATING" : modelAvailable ? "LIVE" : modelBadge}</span>}</div>
