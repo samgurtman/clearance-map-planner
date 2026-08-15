@@ -26,6 +26,7 @@ type Building = Point & {
   topElevationFt?: number;
   sourceKind?: "building" | "faa-obstacle";
   verifiedStatus?: "verified" | "unverified";
+  accuracyCode?: string;
   horizontalAccuracyFt?: number;
   verticalAccuracyFt?: number;
 };
@@ -276,12 +277,17 @@ async function loadFaaObstacleRows(selection: RenderBounds, onProgress?: (value:
     onProgress?.(loaded / keys.length);
     return rows;
   });
-  const rows = shards.flat().filter(([, latitude, longitude]) => (
-    longitude >= coverage.west
-    && longitude <= coverage.east
-    && latitude >= coverage.south
-    && latitude <= coverage.north
-  ));
+  const rows = shards.flat().filter((row) => {
+    const [, latitude, longitude, , , , , accuracy] = row;
+    const horizontalAccuracyFt = faaHorizontalAccuracyFt(accuracy.trim().toUpperCase()[0] || "9") ?? 0;
+    const rowPaddingFt = CLEARANCE_DISTANCE_FT + horizontalAccuracyFt;
+    const latitudePadding = rowPaddingFt / FEET_PER_LAT_DEGREE;
+    const longitudePadding = rowPaddingFt / Math.max(1, feetPerLonDegree(latitude));
+    return longitude >= selection.west - longitudePadding
+      && longitude <= selection.east + longitudePadding
+      && latitude >= selection.south - latitudePadding
+      && latitude <= selection.north + latitudePadding;
+  });
   return { manifest, rows };
 }
 
@@ -489,11 +495,11 @@ function lngLatToLocal(lon: number, lat: number, origin: Origin): Point {
 }
 
 function faaHorizontalAccuracyFt(code: string) {
-  return ({ "1": 20, "2": 50, "3": 100, "4": 250, "5": 500, "6": 1000, "7": 3038, "8": 6076, "9": 6076 } as Record<string, number>)[code] ?? 6076;
+  return ({ "1": 20, "2": 50, "3": 100, "4": 250, "5": 500, "6": 1000, "7": 3038, "8": 6076 } as Record<string, number>)[code] ?? null;
 }
 
 function faaVerticalAccuracyFt(code: string) {
-  return ({ A: 3, B: 10, C: 20, D: 50, E: 125, F: 250, G: 500, H: 1000, I: 1000 } as Record<string, number>)[code] ?? 1000;
+  return ({ A: 3, B: 10, C: 20, D: 50, E: 125, F: 250, G: 500, H: 1000 } as Record<string, number>)[code] ?? null;
 }
 
 function faaObstaclesFromRows(rows: FaaObstacleRow[], origin: Origin): Building[] {
@@ -507,15 +513,16 @@ function faaObstaclesFromRows(rows: FaaObstacleRow[], origin: Origin): Building[
       id: `faa:${id}`,
       name: `FAA ${obstacleType.toLowerCase()} ${id}${verifiedStatus === "unverified" ? " (unverified)" : ""}`,
       ...center,
-      envelopes: [rectangleEnvelope(center.x, center.y, Math.max(20, horizontalAccuracyFt * 2), Math.max(20, horizontalAccuracyFt * 2))],
+      envelopes: [rectangleEnvelope(center.x, center.y, Math.max(20, (horizontalAccuracyFt ?? 0) * 2), Math.max(20, (horizontalAccuracyFt ?? 0) * 2))],
       heightFt: aglFt,
       groundElevationFt: amslFt - aglFt,
-      topElevationFt: amslFt + verticalAccuracyFt,
-      heightSource: `FAA DDOF AMSL + ${verticalAccuracyFt.toLocaleString()} ft accuracy tolerance`,
+      topElevationFt: amslFt,
+      heightSource: "FAA DDOF published AMSL",
       sourceKind: "faa-obstacle",
       verifiedStatus,
-      horizontalAccuracyFt,
-      verticalAccuracyFt,
+      accuracyCode: accuracy,
+      horizontalAccuracyFt: horizontalAccuracyFt ?? undefined,
+      verticalAccuracyFt: verticalAccuracyFt ?? undefined,
     };
   });
 }
@@ -2099,7 +2106,8 @@ export function AirspacePlanner() {
               <div><dt>{(check.marginFt ?? 0) < 0 ? "Shortfall" : "Margin"}</dt><dd>{Math.abs(check.marginFt ?? 0).toLocaleString()} ft</dd></div>
               <div><dt>Surface cell maximum</dt><dd>{check.surfaceElevationFt?.toLocaleString()} ft MSL</dd></div>
               <div><dt>Controlling surface</dt><dd>{check.controllingSource === "obstacle" ? check.obstacle?.name ?? "Obstacle" : "Bare earth"}</dd></div>
-              {check.obstacleTopElevationFt != null && <div><dt>Highest obstacle top</dt><dd>{check.obstacleTopElevationFt.toLocaleString()} ft MSL</dd></div>}
+              {check.obstacleTopElevationFt != null && <div><dt>{check.obstacle?.sourceKind === "faa-obstacle" ? "FAA published obstacle top" : "Highest obstacle top"}</dt><dd>{check.obstacleTopElevationFt.toLocaleString()} ft MSL</dd></div>}
+              {check.obstacle?.sourceKind === "faa-obstacle" && <div><dt>FAA accuracy code</dt><dd>{check.obstacle.accuracyCode || "Unknown"} · H {check.obstacle.horizontalAccuracyFt == null ? "unknown" : `±${check.obstacle.horizontalAccuracyFt.toLocaleString()} ft`} · V {check.obstacle.verticalAccuracyFt == null ? "unknown" : `±${check.obstacle.verticalAccuracyFt.toLocaleString()} ft`}</dd></div>}
               {check.obstacle && <div><dt>Distance to modeled envelope</dt><dd>{Math.round(check.envelopeDistanceFt ?? 0).toLocaleString()} ft</dd></div>}
             </dl> : <p>Click inside a dashed amber study polygon to run the clearance screen.</p>}
           </div>
@@ -2119,12 +2127,12 @@ export function AirspacePlanner() {
           <a className="national-source faa-source" href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/DailyDOF/" target="_blank" rel="noreferrer">
             <span className="source-kicker">KNOWN AVIATION OBSTACLES · FAA SNAPSHOT</span>
             <strong>FAA Daily DOF <b>↗</b></strong>
-            <span>{faaObstacleSnapshot || "Bundled current"} · verified and unverified records · published accuracy modeled</span>
+            <span>{faaObstacleSnapshot || "Bundled current"} · verified and unverified records · published AMSL heights</span>
           </a>
 
           <div className="panel-footer">
             <button onClick={() => setDetailsOpen((current) => !current)}>{detailsOpen ? "Hide" : "Show"} model details <span>{detailsOpen ? "−" : "+"}</span></button>
-            {detailsOpen && <div className="model-details"><p>Red geometry combines conservative surface-elevation cells with a 2,000-ft buffer around active Overture envelopes and accuracy-expanded FAA obstacle points. Overlapping conflicts are dissolved into one layer, so the red shade stays uniform.</p><p><b>This model will never be fully accurate or complete.</b> Airspace, temporary restrictions, weather, routes, takeoff/landing exceptions, and §91.119(a)/(c)/(d) are not modeled.</p></div>}
+            {detailsOpen && <div className="model-details"><p>Red geometry combines conservative surface-elevation cells with a 2,000-ft buffer around active Overture envelopes and FAA obstacle points. Known FAA horizontal tolerance widens the point envelope; unknown accuracy is not replaced with an invented value. Overlapping conflicts are dissolved into one layer.</p><p><b>This model will never be fully accurate or complete.</b> Airspace, temporary restrictions, weather, routes, takeoff/landing exceptions, and §91.119(a)/(c)/(d) are not modeled.</p></div>}
           </div>
         </aside>
 
@@ -2183,7 +2191,7 @@ export function AirspacePlanner() {
           <p>The aircraft altitude is modeled in feet MSL. Required altitude is the greatest of bare-earth surface elevation plus 1,000 feet, a nearby building top plus 1,000 feet, or an FAA-listed obstacle top plus 1,000 feet.</p>
           <p>GeoJSON Polygon and MultiPolygon outer footprints are preserved. The building conflict geometry begins at the closest footprint edge and buffers it by 2,000 feet.</p>
           <p>Overture parent buildings marked <code>has_parts</code> remain as the complete outer envelope. Parts are linked through <code>building_id</code> and retained only when they add a higher modeled top, extend outside the parent, or have no loaded parent. Floating-part tops include <code>min_height</code> or estimated <code>min_floor</code>.</p>
-          <p>FAA Daily DOF records are points, not surveyed footprints. Each point is expanded by its published horizontal accuracy tolerance and its AMSL top is increased by the published vertical tolerance before the 2,000-ft buffer is applied. Records with unknown accuracy use conservative 1-NM horizontal and 1,000-ft vertical defaults.</p>
+          <p>FAA Daily DOF records are points, not surveyed footprints. The model now uses the published AMSL value exactly; vertical accuracy is displayed as metadata and is not added to the obstacle height. Known horizontal tolerance widens the point envelope before the 2,000-ft buffer is applied. Unknown horizontal or vertical accuracy remains explicitly unknown rather than receiving a synthetic default.</p>
           <p>The FAA file includes both verified and unverified obstacles. Both are modeled; unverified values are explicitly unreliable, and the FAA states that the file does not contain every obstruction that may be encountered.</p>
           <p>When more than 500 obstacles are active in the rendered area, nearby envelopes are conservatively grouped for the red overlay so the altitude control stays responsive. The selected-point check still tests the individual building envelopes.</p>
           <p>Terrain tiles are divided into 64×64-pixel cells. Each cell uses its highest DEM pixel, so the surface screen is intentionally conservative. DEM elevations are planning data, not surveyed obstacle or navigation values.</p>
