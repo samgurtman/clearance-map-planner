@@ -2253,17 +2253,6 @@ export function AirspacePlanner() {
 
       <section className="workspace">
         <aside className="control-panel">
-          <div className="eyebrow-row"><span className="eyebrow">FLIGHT ALTITUDE</span><span className={`live-label ${overlayUpdating ? "processing" : modelAvailable ? "" : "paused"}`}><i /> {overlayUpdating ? "UPDATING MODEL" : "ENVELOPE MODEL"}</span></div>
-          <div className="altitude-readout"><strong>{altitudeFt.toLocaleString()}</strong><span>FT<br />MSL</span></div>
-          <label className="slider-wrap"><span className="visually-hidden">Flight altitude in feet above mean sea level</span><input type="range" min="1000" max="18000" step="100" value={altitudeFt} onChange={(event) => setAltitudeFt(Number(event.target.value))} /><span className="range-labels"><b>1,000</b><b>18,000 FT MSL</b></span></label>
-          <div className="preset-row" aria-label="Altitude presets">{[2000, 5000, 10000, 15000].map((preset) => <button key={preset} className={altitudeFt === preset ? "active" : ""} onClick={() => setAltitudeFt(preset)}>{preset.toLocaleString()}</button>)}</div>
-
-          <div className="rule-block">
-            <div className="rule-heading"><span className="rule-number">§</span><span><small>MODELED STANDARD</small>91.119(b) clearance</span></div>
-            <div className="rule-metrics"><div><strong>1,000</strong><span>FT ABOVE</span></div><i /><div><strong>2,000</strong><span>FT FROM ENVELOPE</span></div></div>
-            <p>Altitude is MSL. The model requires 1,000 ft above land/shoreline terrain, building tops, and FAA-listed obstacles within 2,000 ft horizontally. Confident open water has no surface-elevation minimum.</p>
-          </div>
-
           <section className="model-area-panel" aria-label="Model area controls">
             <div className="model-area-copy"><small>MODEL AREA</small><strong>{selectionLabel}</strong></div>
             <label className="tile-budget-control">
@@ -2292,6 +2281,17 @@ export function AirspacePlanner() {
             {renderedBounds && !renderProgress.active && <p className="render-persisted"><i />Rendered result is fixed until you press Re-render.</p>}
             {renderError && <p className="render-error" role="alert">{renderError}</p>}
           </section>
+
+          <div className="eyebrow-row"><span className="eyebrow">FLIGHT ALTITUDE</span><span className={`live-label ${overlayUpdating ? "processing" : modelAvailable ? "" : "paused"}`}><i /> {overlayUpdating ? "UPDATING MODEL" : "ENVELOPE MODEL"}</span></div>
+          <div className="altitude-readout"><strong>{altitudeFt.toLocaleString()}</strong><span>FT<br />MSL</span></div>
+          <label className="slider-wrap"><span className="visually-hidden">Flight altitude in feet above mean sea level</span><input type="range" min="1000" max="18000" step="100" value={altitudeFt} onChange={(event) => setAltitudeFt(Number(event.target.value))} /><span className="range-labels"><b>1,000</b><b>18,000 FT MSL</b></span></label>
+          <div className="preset-row" aria-label="Altitude presets">{[2000, 5000, 10000, 15000].map((preset) => <button key={preset} className={altitudeFt === preset ? "active" : ""} onClick={() => setAltitudeFt(preset)}>{preset.toLocaleString()}</button>)}</div>
+
+          <div className="rule-block">
+            <div className="rule-heading"><span className="rule-number">§</span><span><small>MODELED STANDARD</small>91.119(b) clearance</span></div>
+            <div className="rule-metrics"><div><strong>1,000</strong><span>FT ABOVE</span></div><i /><div><strong>2,000</strong><span>FT FROM ENVELOPE</span></div></div>
+            <p>Altitude is MSL. The model requires 1,000 ft above land/shoreline terrain, building tops, and FAA-listed obstacles within 2,000 ft horizontally. Confident open water has no surface-elevation minimum.</p>
+          </div>
 
           <div className={`point-check ${check.state}`} aria-live="polite">
             <div className="point-check-title"><span className="check-symbol">{check.state === "conflict" ? "!" : check.state === "clear" ? "✓" : check.state === "unavailable" ? "?" : "·"}</span><span><small>SELECTED POINT</small>{statusTitle}</span></div>

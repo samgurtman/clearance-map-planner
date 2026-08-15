@@ -150,7 +150,7 @@ button { color: inherit; }
 .basemap-switch button { min-height: 35px; border: 0; border-right: 1px solid var(--line); padding: 0 11px; background: transparent; color: #657075; font-size: 8px; font-weight: 900; letter-spacing: .06em; text-transform: uppercase; cursor: pointer; }
 .basemap-switch button:last-child { border-right: 0; }
 .basemap-switch button.active { background: var(--ink); color: white; }
-.model-area-panel { margin-top: 18px; padding: 13px; border: 1px solid var(--line); background: #f8f7f1; }
+.model-area-panel { margin-bottom: 20px; padding: 13px; border: 1px solid var(--line); background: #f8f7f1; }
 .model-area-copy { display: flex; flex-direction: column; gap: 4px; }
 .model-area-copy small { color: #858b8d; font-size: 7px; font-weight: 900; letter-spacing: .14em; }
 .model-area-copy strong { font-size: 10px; line-height: 1.35; }
