@@ -150,10 +150,10 @@ button { color: inherit; }
 .basemap-switch button { min-height: 35px; border: 0; border-right: 1px solid var(--line); padding: 0 11px; background: transparent; color: #657075; font-size: 8px; font-weight: 900; letter-spacing: .06em; text-transform: uppercase; cursor: pointer; }
 .basemap-switch button:last-child { border-right: 0; }
 .basemap-switch button.active { background: var(--ink); color: white; }
-.render-toolbar { position: absolute; z-index: 3; top: 136px; right: 18px; width: min(345px, calc(100% - 36px)); padding: 12px; border: 1px solid rgba(24,34,41,.2); background: rgba(255,253,247,.95); backdrop-filter: blur(12px); box-shadow: 0 10px 28px rgba(38,42,42,.12); }
-.render-toolbar-copy { display: flex; flex-direction: column; gap: 4px; }
-.render-toolbar-copy small { color: #858b8d; font-size: 7px; font-weight: 900; letter-spacing: .14em; }
-.render-toolbar-copy strong { font-size: 10px; line-height: 1.35; }
+.model-area-panel { margin-top: 18px; padding: 13px; border: 1px solid var(--line); background: #f8f7f1; }
+.model-area-copy { display: flex; flex-direction: column; gap: 4px; }
+.model-area-copy small { color: #858b8d; font-size: 7px; font-weight: 900; letter-spacing: .14em; }
+.model-area-copy strong { font-size: 10px; line-height: 1.35; }
 .tile-budget-control { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 7px 12px; margin-top: 11px; padding-top: 10px; border-top: 1px solid rgba(70,74,75,.12); }
 .tile-budget-control > span { display: flex; flex-direction: column; gap: 3px; min-width: 78px; }
 .tile-budget-control small { color: #858b8d; font-size: 7px; font-weight: 900; letter-spacing: .1em; }
@@ -269,7 +269,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, canvas:focus-vi
   .map-titlebar { top: 12px; left: 12px; min-width: 250px; }
   .map-controls { top: 12px; right: 12px; }
   .basemap-switch { top: 126px; right: 12px; }
-  .render-toolbar { top: 170px; right: 12px; width: min(345px, calc(100% - 24px)); }
   .legend { top: 70px; left: 12px; }
   .dataset-card { left: 12px; bottom: 18px; }
   .basemap-badge { display: none; }
@@ -283,7 +282,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, canvas:focus-vi
   .map-titlebar { min-width: 0; right: 57px; }
   .map-titlebar small, .map-mode { display: none; }
   .legend { gap: 8px; flex-wrap: wrap; max-width: 230px; }
-  .render-toolbar { left: 12px; width: auto; }
   .dataset-card { right: 12px; width: auto; }
   .dataset-card em { display: none; }
 }
