@@ -13,6 +13,7 @@ import type { GeoJSONSource, Map as MapLibreMap } from "maplibre-gl";
 import clearanceWorkerUrl from "./clearance-worker.ts?worker&url";
 import maplibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
 import {
+  boundsIntersectionWithGeographicAreas,
   boundsWithinGeographicAreas,
   conservativeLongitudePaddingDegrees,
   decodeTerrariumElevationMeters,
@@ -46,7 +47,7 @@ type Building = Point & {
   horizontalAccuracyFt?: number;
   verticalAccuracyFt?: number;
 };
-type Zone = { id: string; label: string; points: Point[]; source: string };
+type Zone = { id: string; label: string; polygons: Point[][][]; source: string };
 type RenderBounds = { west: number; east: number; south: number; north: number };
 type RenderProgress = { active: boolean; value: number; label: string };
 type BuildingLoadResult = { buildings: Building[]; origin: Origin; zones: Zone[] };
@@ -642,15 +643,33 @@ function faaObstaclesFromRows(rows: FaaObstacleRow[], origin: Origin): Building[
   });
 }
 
+function pointOnSegment(value: Point, start: Point, end: Point) {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const squaredLength = dx * dx + dy * dy;
+  if (squaredLength <= 1e-12) return Math.hypot(value.x - start.x, value.y - start.y) <= 1e-6;
+  const cross = (value.x - start.x) * dy - (value.y - start.y) * dx;
+  if (Math.abs(cross) > 1e-6 * Math.sqrt(squaredLength)) return false;
+  const dot = (value.x - start.x) * dx + (value.y - start.y) * dy;
+  return dot >= -1e-6 && dot <= squaredLength + 1e-6;
+}
+
 function pointInPolygon(value: Point, points: Point[]) {
   let inside = false;
   for (let i = 0, j = points.length - 1; i < points.length; j = i, i += 1) {
     const a = points[i];
     const b = points[j];
+    if (pointOnSegment(value, a, b)) return true;
     const crosses = a.y > value.y !== b.y > value.y && value.x < ((b.x - a.x) * (value.y - a.y)) / (b.y - a.y || 1) + a.x;
     if (crosses) inside = !inside;
   }
   return inside;
+}
+
+function pointInZone(value: Point, zone: Zone) {
+  return zone.polygons.some((rings) => rings.length > 0
+    && pointInPolygon(value, rings[0])
+    && !rings.slice(1).some((hole) => pointInPolygon(value, hole)));
 }
 
 function distanceToSegment(value: Point, start: Point, end: Point) {
@@ -692,7 +711,7 @@ function evaluatePointRequirement(
   surfaceElevationFt: number | null,
   openWater: boolean,
 ): Check {
-  const zone = zones.find((candidate) => pointInPolygon(value, candidate.points));
+  const zone = zones.find((candidate) => pointInZone(value, candidate));
   if (!zone) return { state: "outside" };
   if (surfaceElevationFt == null && !openWater) return { state: "unavailable", zone };
   let highest: { building: Building; distance: number } | undefined;
@@ -742,8 +761,12 @@ function buildingFeature(building: Building, origin: Origin): Feature<Polygon | 
   return polygon([closedCoordinates(building.envelopes[0], origin)], properties);
 }
 
-function zoneFeature(zone: Zone, origin: Origin): Feature<Polygon> {
-  return polygon([closedCoordinates(zone.points, origin)], { id: zone.id, label: zone.label, source: zone.source });
+function zoneFeature(zone: Zone, origin: Origin): Feature<Polygon | MultiPolygon> {
+  const coordinates = zone.polygons.map((rings) => rings.map((ring) => closedCoordinates(ring, origin)));
+  const properties = { id: zone.id, label: zone.label, source: zone.source };
+  return coordinates.length > 1
+    ? multiPolygon(coordinates, properties)
+    : polygon(coordinates[0], properties);
 }
 
 function makeConservativeZone(buildings: Building[], label: string): Zone {
@@ -758,7 +781,7 @@ function makeConservativeZone(buildings: Building[], label: string): Zone {
     id: "imported-study-area",
     label,
     source: "Conservative imported-data screen",
-    points: [{ x: minX, y: minY }, { x: maxX, y: minY }, { x: maxX, y: maxY }, { x: minX, y: maxY }],
+    polygons: [[[{ x: minX, y: minY }, { x: maxX, y: minY }, { x: maxX, y: maxY }, { x: minX, y: maxY }]]],
   };
 }
 
@@ -1042,17 +1065,14 @@ function addGroundElevations(buildings: Building[], origin: Origin, terrainIndex
   });
 }
 
-function boundsStudyZone(bounds: RenderBounds, origin: Origin): Zone {
+function geographicStudyZone(polygons: number[][][][], origin: Origin): Zone {
   return {
     id: "rendered-study-area",
-    label: "Selected conservative study area",
-    source: "User-selected bounds; not an FAA designation",
-    points: [
-      lngLatToLocal(bounds.west, bounds.north, origin),
-      lngLatToLocal(bounds.east, bounds.north, origin),
-      lngLatToLocal(bounds.east, bounds.south, origin),
-      lngLatToLocal(bounds.west, bounds.south, origin),
-    ],
+    label: "Selected U.S. study area",
+    source: "User-selected bounds clipped to the supported U.S. boundary; not an FAA designation",
+    polygons: polygons.map((rings) => rings.map((ring) => ring.map(([longitude, latitude]) => (
+      lngLatToLocal(longitude, latitude, origin)
+    )))),
   };
 }
 
@@ -1070,24 +1090,32 @@ function mapViewportBounds(map: MapLibreMap): RenderBounds {
   return { west: bounds.getWest(), east: bounds.getEast(), south: bounds.getSouth(), north: bounds.getNorth() };
 }
 
+function representativePointForStudyArea(polygons: number[][][][], bounds: RenderBounds): [number, number] {
+  const center: [number, number] = [(bounds.west + bounds.east) / 2, (bounds.south + bounds.north) / 2];
+  const area: GeographicArea = { ...bounds, polygons };
+  if (pointInGeographicArea(center[0], center[1], area)) return center;
+  return polygons[0]?.[0]?.[0] as [number, number] || center;
+}
+
+function boundsForGeographicPolygons(polygons: number[][][][]): RenderBounds {
+  const bounds = { west: Infinity, east: -Infinity, south: Infinity, north: -Infinity };
+  polygons.forEach((rings) => rings.forEach((ring) => ring.forEach(([longitude, latitude]) => {
+    bounds.west = Math.min(bounds.west, longitude);
+    bounds.east = Math.max(bounds.east, longitude);
+    bounds.south = Math.min(bounds.south, latitude);
+    bounds.north = Math.max(bounds.north, latitude);
+  })));
+  return bounds;
+}
+
 function boundsForZone(zone: Zone, origin: Origin): RenderBounds {
-  const coordinates = zone.points.map((value) => localToLngLat(value, origin));
+  const coordinates = zone.polygons.flatMap((rings) => rings.flatMap((ring) => ring)).map((value) => localToLngLat(value, origin));
   return {
     west: Math.min(...coordinates.map(([lon]) => lon)),
     east: Math.max(...coordinates.map(([lon]) => lon)),
     south: Math.min(...coordinates.map(([, lat]) => lat)),
     north: Math.max(...coordinates.map(([, lat]) => lat)),
   };
-}
-
-function boundsFeature(bounds: RenderBounds, properties: Record<string, unknown> = {}) {
-  return polygon([[
-    [bounds.west, bounds.north],
-    [bounds.east, bounds.north],
-    [bounds.east, bounds.south],
-    [bounds.west, bounds.south],
-    [bounds.west, bounds.north],
-  ]], properties);
 }
 
 function mapRegionForLocation(longitude: number, latitude: number) {
@@ -1225,7 +1253,16 @@ export function AirspacePlanner() {
     [modeledBuildings, origin],
   );
   const zonesGeoJson = useMemo(() => featureCollection(zones.map((zone) => zoneFeature(zone, origin))), [zones, origin]);
-  const selectionGeoJson = useMemo(() => selectedBounds ? featureCollection([boundsFeature(selectedBounds, { state: "selection" })]) : emptyFeatures(), [selectedBounds]);
+  const selectedStudyGeometry = useMemo(
+    () => selectedBounds ? boundsIntersectionWithGeographicAreas(selectedBounds, usBoundaryAreas) : [],
+    [selectedBounds, usBoundaryAreas],
+  );
+  const selectionGeoJson = useMemo(
+    () => selectedStudyGeometry.length
+      ? featureCollection([multiPolygon(selectedStudyGeometry, { state: "selection" })])
+      : emptyFeatures(),
+    [selectedStudyGeometry],
+  );
   const selectedGeoJson = useMemo(() => featureCollection([point(localToLngLat(selected, origin), { state: check.state })]), [selected, origin, check.state]);
 
   useEffect(() => {
@@ -1646,7 +1683,11 @@ export function AirspacePlanner() {
         }
       };
 
-      const loadVisibleBuildingTiles = async (selection: RenderBounds, onProgress?: (value: number) => void) => {
+      const loadVisibleBuildingTiles = async (
+        selection: RenderBounds,
+        studyPolygons: number[][][][],
+        onProgress?: (value: number) => void,
+      ) => {
         if (liveDataRef.current.sourceMode !== "overture" || !map.getSource("overture-buildings")) return null;
         const requestRelease = release;
         const requestArchive = archive;
@@ -1687,7 +1728,7 @@ export function AirspacePlanner() {
           loadedOriginDataRef.current = nextOrigin;
           loadedBuildingsDataRef.current = [];
           setBuildings([]);
-          setZones([boundsStudyZone(selection, nextOrigin)]);
+          setZones([geographicStudyZone(studyPolygons, nextOrigin)]);
         };
         if (viewportAlreadyCovered && loadedTileKeyRef.current) {
           const cancelledRefresh = Boolean(pendingTileKeyRef.current);
@@ -1696,7 +1737,7 @@ export function AirspacePlanner() {
             pendingTileKeyRef.current = null;
           }
           const stableOrigin = loadedOriginDataRef.current;
-          const nextZones = [boundsStudyZone(selection, stableOrigin)];
+          const nextZones = [geographicStudyZone(studyPolygons, stableOrigin)];
           setZones(nextZones);
           loadedViewportKeyRef.current = viewportKey;
           setCoverageStatus("ready");
@@ -1726,7 +1767,7 @@ export function AirspacePlanner() {
         if (loadedTileKeyRef.current === tileKey) {
           if (loadedViewportKeyRef.current !== viewportKey) {
             const stableOrigin = liveDataRef.current.origin;
-            const nextZones = [boundsStudyZone(selection, stableOrigin)];
+            const nextZones = [geographicStudyZone(studyPolygons, stableOrigin)];
             setZones(nextZones);
             coverageBoundsRef.current = {
               west: Math.min(previousCoverage?.west ?? requiredCoverage.west, requiredCoverage.west),
@@ -1739,7 +1780,7 @@ export function AirspacePlanner() {
           setCoverageStatus("ready");
           onProgress?.(1);
           const stableOrigin = loadedOriginDataRef.current;
-          return { buildings: loadedBuildingsDataRef.current, origin: stableOrigin, zones: [boundsStudyZone(selection, stableOrigin)] } satisfies BuildingLoadResult;
+          return { buildings: loadedBuildingsDataRef.current, origin: stableOrigin, zones: [geographicStudyZone(studyPolygons, stableOrigin)] } satisfies BuildingLoadResult;
         }
         if (pendingTileKeyRef.current === tileKey) return null;
         const requestId = ++loadSerial;
@@ -1803,7 +1844,7 @@ export function AirspacePlanner() {
           }
           if (requestRelease !== release) {
             pendingTileKeyRef.current = null;
-            return loadVisibleBuildingTiles(selection, onProgress);
+            return loadVisibleBuildingTiles(selection, studyPolygons, onProgress);
           }
           const reduction = overtureBuildingsFromFeatures(decoded, nextOrigin, requestGroupBuildingParts);
           const nextBuildings = reduction.buildings;
@@ -1825,7 +1866,7 @@ export function AirspacePlanner() {
           loadedOriginDataRef.current = nextOrigin;
           loadedBuildingsDataRef.current = nextBuildings;
           setBuildings(nextBuildings);
-          const nextZones = [boundsStudyZone(selection, nextOrigin)];
+          const nextZones = [geographicStudyZone(studyPolygons, nextOrigin)];
           setZones(nextZones);
           loadedTileKeyRef.current = tileKey;
           loadedViewportKeyRef.current = viewportKey;
@@ -1883,10 +1924,12 @@ export function AirspacePlanner() {
           setRenderError("The U.S. country boundary is still loading. Try again in a moment.");
           return false;
         }
-        if (!boundsWithinGeographicAreas(selection, supportedUsAreas)) {
-          setRenderError("The Model Area must stay entirely within the supported U.S. territorial boundary.");
+        const studyPolygons = boundsIntersectionWithGeographicAreas(selection, supportedUsAreas);
+        if (!studyPolygons.length) {
+          setRenderError("The Model Area does not overlap the supported U.S. territorial boundary.");
           return false;
         }
+        const studyBounds = boundsForGeographicPolygons(studyPolygons);
         const renderId = ++areaRenderSerial;
         overlayUpdateSerial += 1;
         queuedOverlayAltitude = null;
@@ -1930,9 +1973,9 @@ export function AirspacePlanner() {
           setRenderProgress({ active: true, value, label });
         };
         const stableOrigin = liveDataRef.current.origin;
-        const localZones = [boundsStudyZone(selection, stableOrigin)];
+        const localZones = [geographicStudyZone(studyPolygons, stableOrigin)];
         const buildingPromise: Promise<BuildingLoadResult | null> = liveDataRef.current.sourceMode === "overture"
-          ? loadVisibleBuildingTiles(selection, (value) => {
+          ? loadVisibleBuildingTiles(studyBounds, studyPolygons, (value) => {
             buildingProgress = value;
             reportLoadingProgress();
           })
@@ -1941,11 +1984,11 @@ export function AirspacePlanner() {
           setZones(localZones);
           setCoverageStatus("ready");
         }
-        const terrainPromise = loadVisibleTerrainTiles(selection, (value) => {
+        const terrainPromise = loadVisibleTerrainTiles(studyBounds, (value) => {
           terrainProgress = value;
           reportLoadingProgress();
         });
-        const faaObstaclePromise = loadVisibleFaaObstacles(selection, (value) => {
+        const faaObstaclePromise = loadVisibleFaaObstacles(studyBounds, (value) => {
           faaProgress = value;
           reportLoadingProgress();
         });
@@ -1988,7 +2031,7 @@ export function AirspacePlanner() {
             terrainCells: terrainResult,
             zones: buildingResult.zones,
             origin: buildingResult.origin,
-            renderedBounds: selection,
+            renderedBounds: studyBounds,
           }, (value, label) => {
             if (renderId === areaRenderSerial) setRenderProgress({ active: true, value: Math.round(72 + value * 27), label });
           });
@@ -2003,8 +2046,8 @@ export function AirspacePlanner() {
           }
           return false;
         }
-        setRenderedBounds(selection);
-        setSelectedLngLat([(selection.west + selection.east) / 2, (selection.south + selection.north) / 2]);
+        setRenderedBounds(studyBounds);
+        setSelectedLngLat(representativePointForStudyArea(studyPolygons, studyBounds));
         setRenderProgress({ active: true, value: 100, label: "Render complete" });
         setTimeout(() => {
           if (!disposed && renderId === areaRenderSerial) setRenderProgress({ active: false, value: 100, label: "Render complete" });
@@ -2032,8 +2075,6 @@ export function AirspacePlanner() {
             map.addSource("faa-obstacles", { type: "geojson", data: emptyFeatures() });
             map.addSource("clearance-selected", { type: "geojson", data: emptyFeatures() });
             map.addSource("clearance-selection", { type: "geojson", data: emptyFeatures() });
-            map.addLayer({ id: "unsupported-geography-fill", type: "fill", source: "unsupported-geography", paint: { "fill-color": "#72787a", "fill-opacity": 0.58 } }, beforeId);
-            map.addLayer({ id: "unsupported-geography-line", type: "line", source: "unsupported-geography", paint: { "line-color": "#51585b", "line-width": 1, "line-opacity": 0.72 } }, beforeId);
             map.addLayer({ id: "clearance-zone-fill", type: "fill", source: "clearance-zones", paint: { "fill-color": "#c08a2c", "fill-opacity": 0.07 } }, beforeId);
             map.addLayer({ id: "clearance-zone-line", type: "line", source: "clearance-zones", paint: { "line-color": "#8f6b28", "line-width": 1.25, "line-dasharray": [3, 2] } }, beforeId);
             map.addLayer({ id: "clearance-selection-fill", type: "fill", source: "clearance-selection", paint: { "fill-color": "#276f9e", "fill-opacity": 0.08 } }, beforeId);
@@ -2046,6 +2087,8 @@ export function AirspacePlanner() {
             map.addLayer({ id: "clearance-building-fill", type: "fill", source: "clearance-buildings", paint: { "fill-color": ["step", ["get", "heightFt"], "#89908e", 350, "#4e585c", 800, "#182229"], "fill-opacity": 0.9 } }, beforeId);
             map.addLayer({ id: "clearance-building-line", type: "line", source: "clearance-buildings", paint: { "line-color": "#ffffff", "line-width": 0.65, "line-opacity": 0.72 } }, beforeId);
             map.addLayer({ id: "faa-obstacle-points", type: "circle", source: "faa-obstacles", paint: { "circle-radius": ["interpolate", ["linear"], ["zoom"], 8, 2.5, 15, 4.5, 20, 7], "circle-color": ["match", ["get", "verifiedStatus"], "unverified", "#f0a13b", "#72231d"], "circle-stroke-color": "#fffdf7", "circle-stroke-width": 1.25, "circle-opacity": 0.95 } }, beforeId);
+            map.addLayer({ id: "unsupported-geography-fill", type: "fill", source: "unsupported-geography", paint: { "fill-color": "#72787a", "fill-opacity": 0.92 } }, beforeId);
+            map.addLayer({ id: "unsupported-geography-line", type: "line", source: "unsupported-geography", paint: { "line-color": "#51585b", "line-width": 1, "line-opacity": 0.82 } }, beforeId);
             map.addLayer({ id: "clearance-selected-outer", type: "circle", source: "clearance-selected", paint: { "circle-radius": 10, "circle-color": "#fffdf7", "circle-stroke-width": 4, "circle-stroke-color": ["match", ["get", "state"], "conflict", "#d82f29", "clear", "#176b59", "unavailable", "#c08a2c", "#182229"] } });
             map.addLayer({ id: "clearance-selected-inner", type: "circle", source: "clearance-selected", paint: { "circle-radius": 3, "circle-color": ["match", ["get", "state"], "conflict", "#d82f29", "clear", "#176b59", "unavailable", "#c08a2c", "#182229"] } });
             setCoverageStatus("idle");
@@ -2065,10 +2108,6 @@ export function AirspacePlanner() {
           setRenderError("The U.S. country boundary is still loading. Try again in a moment.");
           return;
         }
-        if (!pointInGeographicAreas(event.lngLat.lng, event.lngLat.lat, supportedUsAreas)) {
-          setRenderError("Start the Model Area inside the supported U.S. territorial boundary.");
-          return;
-        }
         event.preventDefault();
         selectionStartRef.current = [event.lngLat.lng, event.lngLat.lat];
         setSelectedBounds(normalizedBounds(selectionStartRef.current, selectionStartRef.current));
@@ -2081,8 +2120,8 @@ export function AirspacePlanner() {
         if (!drawingAreaRef.current || !selectionStartRef.current) return;
         const selection = normalizedBounds(selectionStartRef.current, [event.lngLat.lng, event.lngLat.lat]);
         setSelectedBounds(selection);
-        if (!boundsWithinGeographicAreas(selection, supportedUsAreas)) {
-          setRenderError("The Model Area crosses outside the supported U.S. boundary.");
+        if (!boundsIntersectionWithGeographicAreas(selection, supportedUsAreas).length) {
+          setRenderError("The Model Area does not overlap the supported U.S. boundary.");
         } else {
           setRenderError("");
         }
@@ -2319,8 +2358,8 @@ export function AirspacePlanner() {
       return;
     }
     const viewBounds = mapViewportBounds(mapRef.current);
-    if (!boundsWithinGeographicAreas(viewBounds, usBoundaryAreas)) {
-      setRenderError("The current view crosses outside the supported U.S. boundary. Zoom in or move the map.");
+    if (!boundsIntersectionWithGeographicAreas(viewBounds, usBoundaryAreas).length) {
+      setRenderError("The current view does not overlap the supported U.S. boundary. Move the map to a supported U.S. location.");
       return;
     }
     setDrawingArea(false);
@@ -2337,8 +2376,8 @@ export function AirspacePlanner() {
         : "The U.S. country boundary is still loading. Try again in a moment.");
       return;
     }
-    if (!boundsWithinGeographicAreas(selectedBounds, usBoundaryAreas)) {
-      setRenderError("The Model Area must stay entirely within the supported U.S. territorial boundary.");
+    if (!boundsIntersectionWithGeographicAreas(selectedBounds, usBoundaryAreas).length) {
+      setRenderError("The Model Area does not overlap the supported U.S. territorial boundary.");
       return;
     }
     setDrawingArea(false);
@@ -2456,19 +2495,24 @@ export function AirspacePlanner() {
             : faaObstacleStatus === "error"
               ? "FAA obstacle coverage is unavailable, so no clearance conclusion is shown."
               : "Building, FAA obstacle, and surface coverage must finish rendering before clearance can be evaluated.";
-  const selectionIsWithinUs = Boolean(selectedBounds && boundsWithinGeographicAreas(selectedBounds, usBoundaryAreas));
+  const selectionOverlapsUs = selectedStudyGeometry.length > 0;
+  const selectionIsClipped = Boolean(selectionOverlapsUs
+    && selectedBounds
+    && !boundsWithinGeographicAreas(selectedBounds, usBoundaryAreas));
   const selectionIsValid = Boolean(selectedBounds
     && selectedBounds.east - selectedBounds.west > 0.000001
     && selectedBounds.north - selectedBounds.south > 0.000001
-    && selectionIsWithinUs);
+    && selectionOverlapsUs);
   const selectionLabel = usBoundaryStatus === "loading"
     ? "Loading U.S. territorial boundary…"
     : usBoundaryStatus === "error"
       ? "U.S. territorial boundary unavailable"
     : drawingArea
     ? "Drag across the map to draw a box"
-    : selectedBounds && !selectionIsWithinUs
-      ? "Selection crosses outside the supported U.S. boundary"
+    : selectedBounds && !selectionOverlapsUs
+      ? "Selection does not overlap the supported U.S. boundary"
+    : selectionIsClipped
+      ? renderedBounds ? "U.S. portion ready · current result stays until re-render" : "U.S. portion selected · ready to render"
     : selectedBounds
       ? renderedBounds ? "New area ready · current result stays until re-render" : "Area selected · ready to render"
       : "Draw a box or use the current view";
@@ -2643,8 +2687,8 @@ export function AirspacePlanner() {
           <p>When more than 500 obstacles are active in the rendered area, nearby envelopes are conservatively grouped for the red overlay so the altitude control stays responsive. The selected-point check still tests the individual building envelopes.</p>
           <p>Terrain tiles are divided into 64×64-pixel cells. Each land or shoreline cell uses its highest DEM pixel, and terrain conflicts expand 2,000 feet horizontally just like obstacle envelopes. Invalid, out-of-range, or incomplete Terrarium tiles stop the model instead of producing a clearance result. Open water uses guarded z{WATER_TILE_ZOOM} Overture geometry; uncertain and intermittent-water cells remain terrain.</p>
           <p>Over open water, §91.119(c) does not prescribe a fixed height above the water surface, but it still restricts proximity to people, vessels, vehicles, and structures, and §91.119(a) still applies. This model preserves building and FAA-obstacle screening but does not know real-time vessel, vehicle, or person locations.</p>
-          <p>Building and terrain evaluation use fixed full-detail tiles independent of camera zoom. Building floor counts use a conservative {ESTIMATED_FLOOR_HEIGHT_FT}-foot-per-floor estimate, while buildings with no height information retain the 30-foot fallback. Each render includes a 2,000-ft halo around the selected box; the selectable tile budget is currently {tileBudget} tiles.</p>
-          <p>Mapping, imports, selected-point checks, and Model Areas are restricted with Overture Maps territorial country and U.S. dependency polygons. Unlike state shoreline polygons, the mask includes Overture’s best approximation of maritime jurisdiction, including the U.S. portions of the Great Lakes. Select a U.S. region from the map control before drawing an area.</p>
+          <p>Building and terrain evaluation use fixed full-detail tiles independent of camera zoom. Building floor counts use a conservative {ESTIMATED_FLOOR_HEIGHT_FT}-foot-per-floor estimate, while buildings with no height information retain the 30-foot fallback. Each render includes a 2,000-ft halo around the U.S.-clipped Model Area; the selectable tile budget is currently {tileBudget} tiles.</p>
+          <p>Mapping, imports, selected-point checks, and Model Areas use Overture Maps territorial country and U.S. dependency polygons. A selection may cross the boundary, but only its U.S. intersection is displayed and evaluated; the remainder stays gray. Unlike state shoreline polygons, the mask includes Overture’s best approximation of maritime jurisdiction, including the U.S. portions of the Great Lakes.</p>
           <p>The rendered result remains fixed while you pan or zoom and changes only when you press Re-render. The FAA evaluates whether an area is “congested” case by case, so the selected box is treated as a conservative study area—not labeled as an official FAA boundary.</p>
           <div className="modal-warning"><b>Small UAS note</b><span>Part 107 generally uses a different 400-foot AGL framework and may require airspace authorization. This prototype models the Part 91 rule named above.</span></div>
           <div className="source-detail">

@@ -17,7 +17,7 @@ type Building = Point & {
   topElevationFt?: number;
   sourceKind?: "building" | "faa-obstacle";
 };
-type Zone = { id: string; label: string; points: Point[]; source: string };
+type Zone = { id: string; label: string; polygons: Point[][][]; source: string };
 type RenderBounds = { west: number; east: number; south: number; north: number };
 type TerrainCell = {
   id: string;
@@ -68,7 +68,7 @@ let hasOpenWaterCells = false;
 let zones: Zone[] = [];
 let origin: Origin = { lat: 0, lon: 0 };
 let renderedBounds: RenderBounds = { west: 0, east: 0, south: 0, north: 0 };
-let zoneFeatures: Array<Feature<Polygon>> = [];
+let zoneFeatures: Array<Feature<Polygon | MultiPolygon>> = [];
 const bufferedBuildingCache = new Map<string, Feature<Polygon | MultiPolygon> | null>();
 const resultCache = new Map<number, ConflictResult>();
 
@@ -98,8 +98,12 @@ function buildingFeature(building: Building): Feature<Polygon | MultiPolygon> {
     : polygon([closedCoordinates(building.envelopes[0])], properties);
 }
 
-function zoneFeature(zone: Zone) {
-  return polygon([closedCoordinates(zone.points)], { id: zone.id, label: zone.label, source: zone.source });
+function zoneFeature(zone: Zone): Feature<Polygon | MultiPolygon> {
+  const coordinates = zone.polygons.map((rings) => rings.map(closedCoordinates));
+  const properties = { id: zone.id, label: zone.label, source: zone.source };
+  return coordinates.length > 1
+    ? multiPolygon(coordinates, properties)
+    : polygon(coordinates[0], properties);
 }
 
 function rectangleEnvelope(x: number, y: number, width: number, depth: number): Point[] {

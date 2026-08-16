@@ -1,4 +1,8 @@
-import { difference as differencePolygons } from "polyclip-ts";
+import {
+  difference as differencePolygons,
+  intersection as intersectPolygons,
+  union as unionPolygons,
+} from "polyclip-ts";
 import type { Geom } from "polyclip-ts";
 
 export const ESTIMATED_FLOOR_HEIGHT_FT = 14;
@@ -259,4 +263,28 @@ export function boundsWithinGeographicAreas(
   ]];
   const uncovered = differencePolygons(selection, ...candidates.map((area) => area.polygons as Geom));
   return uncovered.length === 0;
+}
+
+export function boundsIntersectionWithGeographicAreas(
+  bounds: { west: number; east: number; south: number; north: number },
+  areas: GeographicArea[],
+) {
+  if (!areas.length || bounds.west >= bounds.east || bounds.south >= bounds.north) return [];
+  const candidates = areas.filter((area) => area.west <= bounds.east
+    && area.east >= bounds.west
+    && area.south <= bounds.north
+    && area.north >= bounds.south);
+  if (!candidates.length) return [];
+  const selection: Geom = [[
+    [bounds.west, bounds.north],
+    [bounds.east, bounds.north],
+    [bounds.east, bounds.south],
+    [bounds.west, bounds.south],
+    [bounds.west, bounds.north],
+  ]];
+  const candidateGeometries = candidates.map((area) => area.polygons as Geom);
+  const supportedGeometry = candidateGeometries.length === 1
+    ? candidateGeometries[0]
+    : unionPolygons(candidateGeometries[0], ...candidateGeometries.slice(1));
+  return intersectPolygons(selection, supportedGeometry);
 }

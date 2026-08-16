@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
+  boundsIntersectionWithGeographicAreas,
   boundsWithinGeographicAreas,
   conservativeLongitudePaddingDegrees,
   decodeTerrariumElevationMeters,
@@ -86,6 +87,46 @@ test("builds the gray unsupported mask as the inverse of territorial U.S. geomet
   const unsupportedArea = { west: -179.999, east: 179.999, south: -85, north: 85, polygons: unsupported };
   assert.equal(pointInGeographicAreas(-79.3832, 43.6532, [unsupportedArea]), true);
   assert.equal(pointInGeographicAreas(-87.62, 41.9, [unsupportedArea]), false);
+});
+
+test("clips a model-area rectangle to the supported U.S. geometry", () => {
+  const areas = [{
+    west: -89,
+    east: -86,
+    south: 41,
+    north: 43,
+    polygons: [[[[-89, 43], [-86, 43], [-86, 41], [-89, 41], [-89, 43]]]],
+  }];
+  const clipped = boundsIntersectionWithGeographicAreas(
+    { west: -90, east: -87, south: 42, north: 44 },
+    areas,
+  );
+  assert.deepEqual(clipped, [[[[-89, 42], [-87, 42], [-87, 43], [-89, 43], [-89, 42]]]]);
+  assert.equal(boundsWithinGeographicAreas({ west: -90, east: -87, south: 42, north: 44 }, areas), false);
+  assert.deepEqual(boundsIntersectionWithGeographicAreas(
+    { west: -95, east: -94, south: 42, north: 43 },
+    areas,
+  ), []);
+});
+
+test("preserves holes while clipping a model area", () => {
+  const areas = [{
+    west: -90,
+    east: -86,
+    south: 40,
+    north: 44,
+    polygons: [[
+      [[-90, 44], [-86, 44], [-86, 40], [-90, 40], [-90, 44]],
+      [[-89, 43], [-87, 43], [-87, 41], [-89, 41], [-89, 43]],
+    ]],
+  }];
+  const bounds = { west: -89.5, east: -86.5, south: 40.5, north: 43.5 };
+  const clippedArea = {
+    ...bounds,
+    polygons: boundsIntersectionWithGeographicAreas(bounds, areas),
+  };
+  assert.equal(pointInGeographicAreas(-89.25, 43.25, [clippedArea]), true);
+  assert.equal(pointInGeographicAreas(-88, 42, [clippedArea]), false);
 });
 
 test("the worker buffers terrain from the loaded 2,000-foot halo", async () => {
