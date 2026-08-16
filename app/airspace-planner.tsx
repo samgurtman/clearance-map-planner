@@ -2331,7 +2331,6 @@ export function AirspacePlanner() {
           <div ref={mapContainerRef} className={`map-container ${drawingArea ? "drawing-area" : ""}`} aria-label={`Interactive basemap at ${altitudeFt} feet MSL. Draw a selection box to render a clearance model, or click to check a point in the rendered area.`} />
           {!mapReady && !basemapError && <div className="basemap-loading"><i />Loading basemap…</div>}
           {basemapError && !mapReady && <div className="basemap-loading error">Basemap unavailable. Check your connection.</div>}
-          <div className="map-titlebar"><div><span className="location-pin" aria-hidden="true" /><strong>{sourceMode === "overture" ? "Building + obstacle + surface clearance" : datasetName}</strong><small>{origin.lat.toFixed(4)}° N, {Math.abs(origin.lon).toFixed(4)}° W</small></div><span className="map-mode">2D · MSL</span></div>
           <div className="map-controls" aria-label="Map zoom controls">
             <button onClick={() => mapRef.current?.zoomIn()} aria-label="Zoom in">＋</button>
             <button onClick={() => mapRef.current?.zoomOut()} aria-label="Zoom out">−</button>
