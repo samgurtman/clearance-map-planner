@@ -42,6 +42,7 @@ type PrepareMessage = {
   zones: Zone[];
   origin: Origin;
   renderedBounds: RenderBounds;
+  groupDenseOverlays: boolean;
 };
 type ComputeMessage = { type: "compute"; requestId: number; altitudeFt: number };
 type WorkerRequest = PrepareMessage | ComputeMessage;
@@ -68,6 +69,7 @@ let hasOpenWaterCells = false;
 let zones: Zone[] = [];
 let origin: Origin = { lat: 0, lon: 0 };
 let renderedBounds: RenderBounds = { west: 0, east: 0, south: 0, north: 0 };
+let denseOverlayGroupingEnabled = true;
 let zoneFeatures: Array<Feature<Polygon | MultiPolygon>> = [];
 const bufferedBuildingCache = new Map<string, Feature<Polygon | MultiPolygon> | null>();
 const resultCache = new Map<number, ConflictResult>();
@@ -329,7 +331,7 @@ function computeConflicts(requestId: number, altitudeFt: number): ConflictResult
 
   postProgress(requestId, 0.1, "Selecting active surfaces");
   const activeObstacles = activeBuildingCount(altitudeFt);
-  const displayBuildings = activeObstacles > 500
+  const displayBuildings = denseOverlayGroupingEnabled && activeObstacles > 500
     ? groupedBuildings.filter((building) => {
       const topElevationFt = buildingTopElevationFt(building);
       return topElevationFt != null && altitudeFt < topElevationFt + 1000;
@@ -387,7 +389,8 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   try {
     if (message.type === "prepare") {
       buildings = message.buildings;
-      groupedBuildings = buildings.length > 500 ? groupDenseBuildings(buildings) : [];
+      denseOverlayGroupingEnabled = message.groupDenseOverlays;
+      groupedBuildings = denseOverlayGroupingEnabled && buildings.length > 500 ? groupDenseBuildings(buildings) : [];
       sortedBuildingThresholds = buildings.flatMap((building) => {
         const topElevationFt = buildingTopElevationFt(building);
         return topElevationFt == null ? [] : [topElevationFt + 1000];

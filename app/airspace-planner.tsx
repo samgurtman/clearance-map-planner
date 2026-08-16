@@ -929,7 +929,6 @@ function partExtendsOutsideParent(part: Building, parent: Building) {
 function overtureBuildingsFromFeatures(
   features: Array<Feature<Polygon | MultiPolygon>>,
   origin: Origin,
-  groupBuildingParts: boolean,
 ): OvertureBuildingReduction {
   const records = new Map<string, OvertureBuildingRecord>();
   features.forEach((feature, index) => {
@@ -985,9 +984,8 @@ function overtureBuildingsFromFeatures(
     }
     const partAddsHeight = record.building.heightQuality !== "fallback"
       && (parent.building.heightQuality === "fallback" || record.building.heightFt > parent.building.heightFt + 1);
-    const extendsOutsideParent = groupBuildingParts && partExtendsOutsideParent(record.building, parent.building);
+    const extendsOutsideParent = partExtendsOutsideParent(record.building, parent.building);
     if (shouldRetainOvertureBuildingPart(
-      groupBuildingParts,
       true,
       partAddsHeight,
       extendsOutsideParent,
@@ -1146,7 +1144,7 @@ export function AirspacePlanner() {
   const workerModelReadyRef = useRef(false);
   const renderedAltitudeRef = useRef<number | null>(null);
   const tileBudgetRef = useRef(DEFAULT_TILE_BUDGET);
-  const groupBuildingPartsRef = useRef(true);
+  const groupDenseOverlaysRef = useRef(true);
   const drawingAreaRef = useRef(false);
   const selectionStartRef = useRef<[number, number] | null>(null);
   const coverageBoundsRef = useRef<{ west: number; east: number; south: number; north: number } | null>(null);
@@ -1162,7 +1160,8 @@ export function AirspacePlanner() {
   const liveDataRef = useRef({ altitudeFt: 1800, buildings: [] as Building[], zones: [] as Zone[], origin: CHICAGO_ORIGIN, sourceMode: "overture" as "overture" | "local" });
   const [altitudeFt, setAltitudeFt] = useState(1800);
   const [tileBudget, setTileBudget] = useState(DEFAULT_TILE_BUDGET);
-  const [groupBuildingParts, setGroupBuildingParts] = useState(true);
+  const [groupDenseOverlays, setGroupDenseOverlays] = useState(true);
+  const [renderedDenseOverlayGrouping, setRenderedDenseOverlayGrouping] = useState<boolean | null>(null);
   const [buildings, setBuildings] = useState<Building[]>([]);
   const [zones, setZones] = useState<Zone[]>([]);
   const [origin, setOrigin] = useState<Origin>(CHICAGO_ORIGIN);
@@ -1691,8 +1690,7 @@ export function AirspacePlanner() {
         if (liveDataRef.current.sourceMode !== "overture" || !map.getSource("overture-buildings")) return null;
         const requestRelease = release;
         const requestArchive = archive;
-        const requestGroupBuildingParts = groupBuildingPartsRef.current;
-        const buildingModeKey = requestGroupBuildingParts ? "grouped" : "individual";
+        const buildingModeKey = "parent-plus-necessary-parts";
         const center = { lat: (selection.south + selection.north) / 2, lng: (selection.west + selection.east) / 2 };
         const nextOrigin = { lat: center.lat, lon: center.lng };
         const source = map.getSource("overture-buildings") as GeoJSONSource;
@@ -1846,7 +1844,7 @@ export function AirspacePlanner() {
             pendingTileKeyRef.current = null;
             return loadVisibleBuildingTiles(selection, studyPolygons, onProgress);
           }
-          const reduction = overtureBuildingsFromFeatures(decoded, nextOrigin, requestGroupBuildingParts);
+          const reduction = overtureBuildingsFromFeatures(decoded, nextOrigin);
           const nextBuildings = reduction.buildings;
           const measured = nextBuildings.filter((building) => building.heightQuality !== "fallback").length;
           const retainedDecoded = decoded.filter((feature) => {
@@ -1874,9 +1872,7 @@ export function AirspacePlanner() {
           coverageBoundsRef.current = requiredCoverage;
           setCoverageStatus("ready");
           setDatasetName(`Overture Maps · ${requestRelease}`);
-          setDataNote(requestGroupBuildingParts
-            ? `${reduction.parentCount.toLocaleString()} parent envelopes + ${reduction.retainedPartCount.toLocaleString()} of ${reduction.totalPartCount.toLocaleString()} necessary parts · ${measured.toLocaleString()} with height/floor data · ${coordinates.length} full-detail z${zoom} tile${coordinates.length === 1 ? "" : "s"}`
-            : `${reduction.parentCount.toLocaleString()} parent envelopes + all ${reduction.totalPartCount.toLocaleString()} individual parts · ${measured.toLocaleString()} with height/floor data · ${coordinates.length} full-detail z${zoom} tile${coordinates.length === 1 ? "" : "s"}`);
+          setDataNote(`${reduction.parentCount.toLocaleString()} parent envelopes + ${reduction.retainedPartCount.toLocaleString()} of ${reduction.totalPartCount.toLocaleString()} necessary parts · ${measured.toLocaleString()} with height/floor data · ${coordinates.length} full-detail z${zoom} tile${coordinates.length === 1 ? "" : "s"}`);
           onProgress?.(1);
           return { buildings: nextBuildings, origin: nextOrigin, zones: nextZones } satisfies BuildingLoadResult;
         } catch (error) {
@@ -2032,6 +2028,7 @@ export function AirspacePlanner() {
             zones: buildingResult.zones,
             origin: buildingResult.origin,
             renderedBounds: studyBounds,
+            groupDenseOverlays: groupDenseOverlaysRef.current,
           }, (value, label) => {
             if (renderId === areaRenderSerial) setRenderProgress({ active: true, value: Math.round(72 + value * 27), label });
           });
@@ -2047,6 +2044,7 @@ export function AirspacePlanner() {
           return false;
         }
         setRenderedBounds(studyBounds);
+        setRenderedDenseOverlayGrouping(groupDenseOverlaysRef.current);
         setSelectedLngLat(representativePointForStudyArea(studyPolygons, studyBounds));
         setRenderProgress({ active: true, value: 100, label: "Render complete" });
         setTimeout(() => {
@@ -2503,6 +2501,8 @@ export function AirspacePlanner() {
     && selectedBounds.east - selectedBounds.west > 0.000001
     && selectedBounds.north - selectedBounds.south > 0.000001
     && selectionOverlapsUs);
+  const denseOverlaySettingPending = Boolean(renderedBounds
+    && renderedDenseOverlayGrouping !== groupDenseOverlays);
   const selectionLabel = usBoundaryStatus === "loading"
     ? "Loading U.S. territorial boundary…"
     : usBoundaryStatus === "error"
@@ -2562,23 +2562,20 @@ export function AirspacePlanner() {
             <button aria-expanded={detailsOpen} aria-controls="model-details" onClick={() => setDetailsOpen((current) => !current)}>{detailsOpen ? "Hide" : "Show"} model details <span>{detailsOpen ? "−" : "+"}</span></button>
             {detailsOpen && <div className="model-details" id="model-details">
               <div className="model-layers-card"><span className="dataset-icon" aria-hidden="true">▤</span><span><small>{sourceMode === "overture" ? "AUTOMATIC MODEL LAYERS" : "LOCAL BUILDINGS + TERRAIN"}</small><strong>{datasetName}</strong><em>{dataNote}</em><em>{terrainNote}</em><em>{faaObstacleNote}</em></span>{sourceMode === "local" ? <button onClick={activateOverture}>Use Overture</button> : <span className={`data-live ${modelAvailable ? "" : "paused"}`}>{overlayUpdating ? "UPDATING" : modelAvailable ? "LIVE" : modelBadge}</span>}</div>
-              {sourceMode === "overture" && <label className="building-parts-option" htmlFor="group-building-parts" aria-label="Group related building parts">
+              <label className="dense-overlay-option" htmlFor="group-dense-overlays" aria-label="Group dense red clearance overlays">
                 <input
-                  id="group-building-parts"
+                  id="group-dense-overlays"
                   type="checkbox"
-                  checked={groupBuildingParts}
+                  checked={groupDenseOverlays}
                   disabled={renderProgress.active}
                   onChange={(event) => {
                     const nextValue = event.target.checked;
-                    groupBuildingPartsRef.current = nextValue;
-                    setGroupBuildingParts(nextValue);
-                    setDataNote(nextValue
-                      ? "Grouped parent-building handling selected · press Render or Re-render to apply"
-                      : "Every parent and building part will be modeled independently · press Render or Re-render to apply");
+                    groupDenseOverlaysRef.current = nextValue;
+                    setGroupDenseOverlays(nextValue);
                   }}
                 />
-                <span><strong>Group related building parts</strong><small>{groupBuildingParts ? "ON · parent envelope plus only necessary parts" : "OFF · every loaded parent and part is retained"}</small></span>
-              </label>}
+                <span><strong>Group dense red overlays</strong><small>{groupDenseOverlays ? "ON · group nearby envelopes above 500 active obstacles" : "OFF · preserve every active obstacle envelope"}{denseOverlaySettingPending ? " · Re-render to apply" : ""}</small></span>
+              </label>
               <a className="national-source" href="https://docs.overturemaps.org/guides/buildings/" target="_blank" rel="noreferrer">
                 <span className="source-kicker">AUTOMATIC NATIONAL LAYER · LIVE</span>
                 <strong>Overture Maps Buildings <b>↗</b></strong>
@@ -2681,10 +2678,10 @@ export function AirspacePlanner() {
           <p><b>This model will never be fully accurate or complete.</b> It cannot establish legality, authorization, obstacle clearance, or safe flight. Always use current official aeronautical sources and independent preflight judgment.</p>
           <p>The aircraft altitude is modeled in feet MSL. Required altitude uses the highest modeled land or shoreline terrain, building top, or FAA-listed obstacle top within 2,000 feet, plus 1,000 feet. Confident open water creates no surface minimum by itself, but nearby land terrain remains active.</p>
           <p>GeoJSON Polygon and MultiPolygon outer footprints are preserved. The building conflict geometry begins at the closest footprint edge and buffers it by 2,000 feet.</p>
-          <p>By default, Overture parent buildings marked <code>has_parts</code> remain as the complete outer envelope. Parts are linked through <code>building_id</code> and retained only when they add a higher modeled top, extend outside the parent, or have no loaded parent. The model-details control can disable that grouping so every loaded parent and part is retained independently on the next render. Floating-part tops include <code>min_height</code> or estimated <code>min_floor</code>.</p>
+          <p>Overture parent buildings marked <code>has_parts</code> remain as the complete outer envelope. Parts are linked through <code>building_id</code> and retained when they add a higher modeled top, extend outside the parent, or have no loaded parent. Floating-part tops include <code>min_height</code> or estimated <code>min_floor</code>.</p>
           <p>FAA Daily DOF records are points, not surveyed footprints. Known vertical tolerance is added to the published AMSL value before clearance is calculated. Known horizontal tolerance widens the point envelope before the 2,000-ft buffer is applied. Unknown horizontal accuracy keeps the 20-foot minimum point envelope, while unknown vertical accuracy remains unadjusted and explicitly unknown.</p>
           <p>The FAA file includes both verified and unverified obstacles. Both are modeled; unverified values are explicitly unreliable, and the FAA states that the file does not contain every obstruction that may be encountered.</p>
-          <p>When more than 500 obstacles are active in the rendered area, nearby envelopes are conservatively grouped for the red overlay so the altitude control stays responsive. The selected-point check still tests the individual building envelopes.</p>
+          <p>When the dense-overlay option is enabled and more than 500 obstacles are active, nearby envelopes are conservatively grouped for the red overlay so the altitude control stays responsive. Turning the option off preserves every active obstacle envelope in the red geometry. The selected-point check always tests individual building envelopes.</p>
           <p>Terrain tiles are divided into 64×64-pixel cells. Each land or shoreline cell uses its highest DEM pixel, and terrain conflicts expand 2,000 feet horizontally just like obstacle envelopes. Invalid, out-of-range, or incomplete Terrarium tiles stop the model instead of producing a clearance result. Open water uses guarded z{WATER_TILE_ZOOM} Overture geometry; uncertain and intermittent-water cells remain terrain.</p>
           <p>Over open water, §91.119(c) does not prescribe a fixed height above the water surface, but it still restricts proximity to people, vessels, vehicles, and structures, and §91.119(a) still applies. This model preserves building and FAA-obstacle screening but does not know real-time vessel, vehicle, or person locations.</p>
           <p>Building and terrain evaluation use fixed full-detail tiles independent of camera zoom. Building floor counts use a conservative {ESTIMATED_FLOOR_HEIGHT_FT}-foot-per-floor estimate, while buildings with no height information retain the 30-foot fallback. Each render includes a 2,000-ft halo around the U.S.-clipped Model Area; the selectable tile budget is currently {tileBudget} tiles.</p>
@@ -2693,7 +2690,7 @@ export function AirspacePlanner() {
           <div className="modal-warning"><b>Small UAS note</b><span>Part 107 generally uses a different 400-foot AGL framework and may require airspace authorization. This prototype models the Part 91 rule named above.</span></div>
           <div className="source-detail">
             <h3>Automatic national source: Overture Maps</h3>
-            <p>The map loads Overture’s official global Buildings PMTiles archive for the current release. Polygon/MultiPolygon parent footprints are preserved. Grouped mode removes redundant part geometry after evaluating its parent relationship and top height; independent mode retains every loaded parent and part.</p>
+            <p>The map loads Overture’s official global Buildings PMTiles archive for the current release. Polygon/MultiPolygon parent footprints are preserved, while redundant part geometry is removed only after evaluating its parent relationship, footprint extent, and modeled top height.</p>
             <a href="https://docs.overturemaps.org/guides/buildings/" target="_blank" rel="noreferrer">Open Overture Buildings guide ↗</a>
           </div>
           <div className="source-detail">

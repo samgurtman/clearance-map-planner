@@ -132,12 +132,11 @@ export function faaUpperBoundAmslFt(publishedAmslFt: number, knownVerticalTolera
 }
 
 export function shouldRetainOvertureBuildingPart(
-  groupBuildingParts: boolean,
   hasLoadedParent: boolean,
   addsHeight: boolean,
   extendsOutsideParent: boolean,
 ) {
-  return !groupBuildingParts || !hasLoadedParent || addsHeight || extendsOutsideParent;
+  return !hasLoadedParent || addsHeight || extendsOutsideParent;
 }
 
 export type TerrainCellLike = {

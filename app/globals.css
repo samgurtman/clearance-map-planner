@@ -200,12 +200,12 @@ button { color: inherit; }
 .model-layers-card button { margin-left: auto; border: 0; border-bottom: 1px solid var(--ink); background: transparent; padding: 2px 0; font-size: 8px; font-weight: 900; text-transform: uppercase; cursor: pointer; }
 .data-live { margin-left: auto; color: var(--clear); font-size: 8px; font-weight: 900; letter-spacing: .13em; }
 .data-live.paused { color: var(--amber); }
-.building-parts-option { display: flex; align-items: flex-start; gap: 10px; margin-top: 8px; padding: 11px 12px; border: 1px solid var(--line); background: #f7f5ee; cursor: pointer; }
-.building-parts-option input { width: 15px; height: 15px; flex: 0 0 15px; margin: 1px 0 0; accent-color: var(--signal); cursor: pointer; }
-.building-parts-option input:disabled { cursor: wait; opacity: .5; }
-.building-parts-option > span { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
-.building-parts-option strong { color: var(--ink); font-size: 9px; }
-.building-parts-option small { color: #747b7e; font-size: 8px; line-height: 1.4; }
+.dense-overlay-option { display: flex; align-items: flex-start; gap: 10px; margin-top: 8px; padding: 11px 12px; border: 1px solid var(--line); background: #f7f5ee; cursor: pointer; }
+.dense-overlay-option input { width: 15px; height: 15px; flex: 0 0 15px; margin: 1px 0 0; accent-color: var(--signal); cursor: pointer; }
+.dense-overlay-option input:disabled { cursor: wait; opacity: .5; }
+.dense-overlay-option > span { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.dense-overlay-option strong { color: var(--ink); font-size: 9px; }
+.dense-overlay-option small { color: #747b7e; font-size: 8px; line-height: 1.4; }
 .basemap-badge { position: absolute; z-index: 2; bottom: 28px; right: 125px; font-size: 7px; font-weight: 800; letter-spacing: .08em; color: #687073; background: rgba(255,253,247,.82); padding: 5px 7px; }
 
 .national-source { display: flex; flex-direction: column; gap: 4px; margin-top: 16px; padding: 12px; border: 1px solid var(--line); background: #f2f1eb; color: var(--ink); text-decoration: none; transition: border-color .15s, background .15s; }

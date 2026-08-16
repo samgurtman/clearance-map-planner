@@ -58,11 +58,11 @@ test("uses the limiting latitude for a long model-area clearance halo", () => {
   assert.ok(longAreaPadding > centerOnlyPadding * 1.1);
 });
 
-test("can retain every Overture building part when grouping is disabled", () => {
-  assert.equal(shouldRetainOvertureBuildingPart(true, true, false, false), false);
-  assert.equal(shouldRetainOvertureBuildingPart(false, true, false, false), true);
-  assert.equal(shouldRetainOvertureBuildingPart(true, true, true, false), true);
-  assert.equal(shouldRetainOvertureBuildingPart(true, false, false, false), true);
+test("retains only Overture parts that add information to their parent", () => {
+  assert.equal(shouldRetainOvertureBuildingPart(true, false, false), false);
+  assert.equal(shouldRetainOvertureBuildingPart(true, true, false), true);
+  assert.equal(shouldRetainOvertureBuildingPart(true, false, true), true);
+  assert.equal(shouldRetainOvertureBuildingPart(false, false, false), true);
 });
 
 test("uses only Overture territorial country and U.S. dependency polygons", () => {
@@ -134,4 +134,10 @@ test("the worker buffers terrain from the loaded 2,000-foot halo", async () => {
   assert.match(worker, /bufferedTerrainConflictFeatures/);
   assert.match(worker, /buffer\(feature, CLEARANCE_DISTANCE_FT/);
   assert.match(worker, /screenedTerrainCells = message\.terrainCells\.filter/);
+});
+
+test("the worker applies dense obstacle grouping only when the UI option enables it", async () => {
+  const worker = await readFile(new URL("../app/clearance-worker.ts", import.meta.url), "utf8");
+  assert.match(worker, /denseOverlayGroupingEnabled = message\.groupDenseOverlays/);
+  assert.match(worker, /denseOverlayGroupingEnabled && activeObstacles > 500/);
 });
