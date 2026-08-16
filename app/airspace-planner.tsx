@@ -2305,6 +2305,8 @@ export function AirspacePlanner() {
             {detailsOpen && <div className="model-details"><p>Red geometry combines conservative land/shoreline elevation cells with a 2,000-ft buffer around active Overture envelopes and FAA obstacle points. Confident open-water cells are omitted from the terrain mask, but modeled obstacles remain active. Overlapping conflicts are dissolved into one layer.</p><p><b>This model will never be fully accurate or complete.</b> Airspace, temporary restrictions, weather, vessels, people, vehicles, routes, takeoff/landing exceptions, and §91.119(a)/(c)/(d) conditions are not fully modeled.</p></div>}
           </div>
 
+          <div className="model-layers-card"><span className="dataset-icon" aria-hidden="true">▤</span><span><small>{sourceMode === "overture" ? "AUTOMATIC MODEL LAYERS" : "LOCAL BUILDINGS + TERRAIN"}</small><strong>{datasetName}</strong><em>{dataNote}</em><em>{terrainNote}</em><em>{faaObstacleNote}</em></span>{sourceMode === "local" ? <button onClick={activateOverture}>Use Overture</button> : <span className={`data-live ${modelAvailable ? "" : "paused"}`}>{overlayUpdating ? "UPDATING" : modelAvailable ? "LIVE" : modelBadge}</span>}</div>
+
           <section className="tile-budget-panel" aria-label="Tile budget controls">
             <label className="tile-budget-control">
               <span><small>FULL-DETAIL TILE BUDGET</small><strong>{tileBudget}</strong></span>
@@ -2362,7 +2364,6 @@ export function AirspacePlanner() {
             </div>
           </div>}
           <div className="legend" aria-label="Map legend"><span><i className="legend-red" />Clearance conflict</span><span><i className="legend-amber" />Rendered area</span><span><i className="legend-blue" />Selection</span><span><i className="legend-building" />Building</span><span><i className="legend-faa" />FAA obstacle</span></div>
-          <div className="dataset-card"><span className="dataset-icon" aria-hidden="true">▤</span><span><small>{sourceMode === "overture" ? "AUTOMATIC MODEL LAYERS" : "LOCAL BUILDINGS + TERRAIN"}</small><strong>{datasetName}</strong><em>{dataNote}</em><em>{terrainNote}</em><em>{faaObstacleNote}</em></span>{sourceMode === "local" ? <button onClick={activateOverture}>Use Overture</button> : <span className={`data-live ${modelAvailable ? "" : "paused"}`}>{overlayUpdating ? "UPDATING" : modelAvailable ? "LIVE" : modelBadge}</span>}</div>
           <div className="basemap-badge">BASEMAP · {basemap === "street" ? "CARTO / OPENSTREETMAP" : "FAA SECTIONAL + TAC"}</div>
         </section>
       </section>
