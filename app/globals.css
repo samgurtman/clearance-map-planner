@@ -180,7 +180,7 @@ button { color: inherit; }
 .render-progress-track.indeterminate i { width: 38%; animation: render-progress-sweep 1.05s ease-in-out infinite; }
 @keyframes render-progress-sweep { from { transform: translateX(-105%); } to { transform: translateX(275%); } }
 .render-progress > p { margin: 10px 0 0; color: #737b7e; font-size: 8px; line-height: 1.5; }
-.legend { position: absolute; z-index: 2; top: 136px; left: 18px; display: flex; gap: 14px; padding: 9px 11px; background: rgba(255,253,247,.9); border: 1px solid rgba(24,34,41,.15); font-size: 8px; font-weight: 800; }
+.legend { position: absolute; z-index: 2; right: 18px; bottom: 58px; max-width: min(430px, calc(100% - 36px)); display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 14px; padding: 9px 11px; background: rgba(255,253,247,.9); border: 1px solid rgba(24,34,41,.15); font-size: 8px; font-weight: 800; }
 .legend span { display: flex; align-items: center; gap: 6px; }
 .legend i { width: 10px; height: 10px; display: inline-block; }
 .legend-red { background: rgba(223,61,51,.72); border-radius: 50%; }
@@ -243,6 +243,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, canvas:focus-vi
 @media (max-width: 1300px) {
   .rule-chip, .overture-status { display: none; }
   .brand { width: 318px; }
+  .legend { bottom: 142px; }
 }
 
 @media (max-width: 760px) {
@@ -265,7 +266,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, canvas:focus-vi
   .map-controls { top: 12px; right: 12px; }
   .basemap-switch { top: 126px; right: 12px; }
   .model-area-toolbar { top: 12px; left: 12px; width: min(345px, calc(100% - 69px)); }
-  .legend { top: 170px; left: 12px; }
+  .legend { right: 12px; bottom: 150px; max-width: min(360px, calc(100% - 24px)); }
   .dataset-card { left: 12px; bottom: 18px; }
   .basemap-badge { display: none; }
   .legal-bar { flex-basis: auto; min-height: 42px; }
@@ -275,7 +276,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, canvas:focus-vi
 @media (max-width: 480px) {
   .brand { font-size: 12px; letter-spacing: .12em; }
   .brand-mark { width: 23px; height: 23px; }
-  .legend { gap: 8px; flex-wrap: wrap; max-width: 230px; }
+  .legend { bottom: 96px; gap: 8px; max-width: 230px; }
   .dataset-card { right: 12px; width: auto; }
   .dataset-card em { display: none; }
 }
