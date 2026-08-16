@@ -2243,6 +2243,32 @@ export function AirspacePlanner() {
     <main className="app-shell">
       <header className="topbar">
         <button className="brand" onClick={activateOverture} aria-label="Clearance home and use automatic Overture buildings"><span className="brand-mark" aria-hidden="true"><i /></span><span>CLEARANCE</span></button>
+        <section className="model-area-header" aria-label="Model area controls">
+          <div className="model-area-copy" aria-live="polite"><small>MODEL AREA</small><strong className={renderError ? "error" : ""} role={renderError ? "alert" : undefined}>{renderError || selectionLabel}</strong></div>
+          <label className="tile-budget-control">
+            <span><small>FULL-DETAIL TILE BUDGET</small><strong>{tileBudget}</strong></span>
+            <input
+              type="range"
+              min={MIN_TILE_BUDGET}
+              max={MAX_TILE_BUDGET}
+              step="32"
+              value={tileBudget}
+              disabled={renderProgress.active}
+              onChange={(event) => {
+                const nextBudget = Number(event.target.value);
+                tileBudgetRef.current = nextBudget;
+                setTileBudget(nextBudget);
+              }}
+              aria-label="Full-detail building and elevation tile budget"
+            />
+            <em><b>{MIN_TILE_BUDGET}</b><b>{MAX_TILE_BUDGET.toLocaleString()}</b></em>
+          </label>
+          <div className="render-actions">
+            <button className={drawingArea ? "active" : ""} aria-pressed={drawingArea} onClick={beginAreaSelection}>{drawingArea ? "Cancel draw" : "Draw area"}</button>
+            <button onClick={useCurrentView} disabled={!mapReady || renderProgress.active}>Use view</button>
+            <button className="render-primary" onClick={renderSelectedArea} disabled={!selectionIsValid || renderProgress.active}>{renderedBounds ? "Re-render" : "Render"}</button>
+          </div>
+        </section>
         <div className="rule-chip"><span>RULESET</span> FAA §91.119(b)</div>
         <div className="topbar-actions">
           <div className={`overture-status ${modelStatusClass}`}><span className="status-dot" /><span><small>MODEL DATA</small>{overlayUpdating ? "Updating clearance overlay" : modelDataLabel}</span></div>
@@ -2253,35 +2279,6 @@ export function AirspacePlanner() {
 
       <section className="workspace">
         <aside className="control-panel">
-          <section className="model-area-panel" aria-label="Model area controls">
-            <div className="model-area-copy"><small>MODEL AREA</small><strong>{selectionLabel}</strong></div>
-            <label className="tile-budget-control">
-              <span><small>FULL-DETAIL TILE BUDGET</small><strong>{tileBudget}</strong></span>
-              <input
-                type="range"
-                min={MIN_TILE_BUDGET}
-                max={MAX_TILE_BUDGET}
-                step="32"
-                value={tileBudget}
-                disabled={renderProgress.active}
-                onChange={(event) => {
-                  const nextBudget = Number(event.target.value);
-                  tileBudgetRef.current = nextBudget;
-                  setTileBudget(nextBudget);
-                }}
-                aria-label="Full-detail building and elevation tile budget"
-              />
-              <em><b>{MIN_TILE_BUDGET}</b><b>{MAX_TILE_BUDGET.toLocaleString()}</b></em>
-            </label>
-            <div className="render-actions">
-              <button className={drawingArea ? "active" : ""} aria-pressed={drawingArea} onClick={beginAreaSelection}>{drawingArea ? "Cancel draw" : "Draw area"}</button>
-              <button onClick={useCurrentView} disabled={!mapReady || renderProgress.active}>Use view</button>
-              <button className="render-primary" onClick={renderSelectedArea} disabled={!selectionIsValid || renderProgress.active}>{renderedBounds ? "Re-render" : "Render"}</button>
-            </div>
-            {renderedBounds && !renderProgress.active && <p className="render-persisted"><i />Rendered result is fixed until you press Re-render.</p>}
-            {renderError && <p className="render-error" role="alert">{renderError}</p>}
-          </section>
-
           <div className="eyebrow-row"><span className="eyebrow">FLIGHT ALTITUDE</span><span className={`live-label ${overlayUpdating ? "processing" : modelAvailable ? "" : "paused"}`}><i /> {overlayUpdating ? "UPDATING MODEL" : "ENVELOPE MODEL"}</span></div>
           <div className="altitude-readout"><strong>{altitudeFt.toLocaleString()}</strong><span>FT<br />MSL</span></div>
           <label className="slider-wrap"><span className="visually-hidden">Flight altitude in feet above mean sea level</span><input type="range" min="1000" max="18000" step="100" value={altitudeFt} onChange={(event) => setAltitudeFt(Number(event.target.value))} /><span className="range-labels"><b>1,000</b><b>18,000 FT MSL</b></span></label>
