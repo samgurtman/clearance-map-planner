@@ -2243,32 +2243,6 @@ export function AirspacePlanner() {
     <main className="app-shell">
       <header className="topbar">
         <button className="brand" onClick={activateOverture} aria-label="Clearance home and use automatic Overture buildings"><span className="brand-mark" aria-hidden="true"><i /></span><span>CLEARANCE</span></button>
-        <section className="model-area-header" aria-label="Model area controls">
-          <div className="model-area-copy" aria-live="polite"><small>MODEL AREA</small><strong className={renderError ? "error" : ""} role={renderError ? "alert" : undefined}>{renderError || selectionLabel}</strong></div>
-          <label className="tile-budget-control">
-            <span><small>FULL-DETAIL TILE BUDGET</small><strong>{tileBudget}</strong></span>
-            <input
-              type="range"
-              min={MIN_TILE_BUDGET}
-              max={MAX_TILE_BUDGET}
-              step="32"
-              value={tileBudget}
-              disabled={renderProgress.active}
-              onChange={(event) => {
-                const nextBudget = Number(event.target.value);
-                tileBudgetRef.current = nextBudget;
-                setTileBudget(nextBudget);
-              }}
-              aria-label="Full-detail building and elevation tile budget"
-            />
-            <em><b>{MIN_TILE_BUDGET}</b><b>{MAX_TILE_BUDGET.toLocaleString()}</b></em>
-          </label>
-          <div className="render-actions">
-            <button className={drawingArea ? "active" : ""} aria-pressed={drawingArea} onClick={beginAreaSelection}>{drawingArea ? "Cancel draw" : "Draw area"}</button>
-            <button onClick={useCurrentView} disabled={!mapReady || renderProgress.active}>Use view</button>
-            <button className="render-primary" onClick={renderSelectedArea} disabled={!selectionIsValid || renderProgress.active}>{renderedBounds ? "Re-render" : "Render"}</button>
-          </div>
-        </section>
         <div className="rule-chip"><span>RULESET</span> FAA §91.119(b)</div>
         <div className="topbar-actions">
           <div className={`overture-status ${modelStatusClass}`}><span className="status-dot" /><span><small>MODEL DATA</small>{overlayUpdating ? "Updating clearance overlay" : modelDataLabel}</span></div>
@@ -2330,6 +2304,27 @@ export function AirspacePlanner() {
             <button onClick={() => setDetailsOpen((current) => !current)}>{detailsOpen ? "Hide" : "Show"} model details <span>{detailsOpen ? "−" : "+"}</span></button>
             {detailsOpen && <div className="model-details"><p>Red geometry combines conservative land/shoreline elevation cells with a 2,000-ft buffer around active Overture envelopes and FAA obstacle points. Confident open-water cells are omitted from the terrain mask, but modeled obstacles remain active. Overlapping conflicts are dissolved into one layer.</p><p><b>This model will never be fully accurate or complete.</b> Airspace, temporary restrictions, weather, vessels, people, vehicles, routes, takeoff/landing exceptions, and §91.119(a)/(c)/(d) conditions are not fully modeled.</p></div>}
           </div>
+
+          <section className="tile-budget-panel" aria-label="Tile budget controls">
+            <label className="tile-budget-control">
+              <span><small>FULL-DETAIL TILE BUDGET</small><strong>{tileBudget}</strong></span>
+              <input
+                type="range"
+                min={MIN_TILE_BUDGET}
+                max={MAX_TILE_BUDGET}
+                step="32"
+                value={tileBudget}
+                disabled={renderProgress.active}
+                onChange={(event) => {
+                  const nextBudget = Number(event.target.value);
+                  tileBudgetRef.current = nextBudget;
+                  setTileBudget(nextBudget);
+                }}
+                aria-label="Full-detail building and elevation tile budget"
+              />
+              <em><b>{MIN_TILE_BUDGET}</b><b>{MAX_TILE_BUDGET.toLocaleString()}</b></em>
+            </label>
+          </section>
         </aside>
 
         <section className="map-panel" aria-label="Interactive two-dimensional clearance map">
@@ -2346,6 +2341,15 @@ export function AirspacePlanner() {
             <button className={basemap === "street" ? "active" : ""} aria-pressed={basemap === "street"} onClick={() => setBasemap("street")}>Street</button>
             <button className={basemap === "sectional" ? "active" : ""} aria-pressed={basemap === "sectional"} title="Sectionals with Terminal Area Charts where available" onClick={() => setBasemap("sectional")}>FAA Charts</button>
           </div>
+          <section className="model-area-toolbar" aria-label="Model area controls">
+            <div className="model-area-copy" aria-live="polite"><small>MODEL AREA</small><strong className={renderError ? "error" : ""} role={renderError ? "alert" : undefined}>{renderError || selectionLabel}</strong></div>
+            <div className="render-actions">
+              <button className={drawingArea ? "active" : ""} aria-pressed={drawingArea} onClick={beginAreaSelection}>{drawingArea ? "Cancel draw" : "Draw area"}</button>
+              <button onClick={useCurrentView} disabled={!mapReady || renderProgress.active}>Use view</button>
+              <button className="render-primary" onClick={renderSelectedArea} disabled={!selectionIsValid || renderProgress.active}>{renderedBounds ? "Re-render" : "Render"}</button>
+            </div>
+            {renderedBounds && !renderProgress.active && <p className="render-persisted"><i />Rendered result is fixed until you press Re-render.</p>}
+          </section>
           {(renderProgress.active || overlayUpdating) && <div className="map-processing-overlay" role="status" aria-live="polite" aria-busy="true">
             <div className="render-progress">
               <div className="render-progress-copy">
