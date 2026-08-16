@@ -256,7 +256,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, canvas:focus-vi
   .altitude-readout strong { font-size: 45px; }
   .slider-wrap { margin-left: 44%; padding-top: 21px; }
   .preset-row { clear: both; margin: 14px 0; }
-  .rule-block, .screen-summary, .panel-footer, .national-source { display: none; }
+  .rule-block, .screen-summary { display: none; }
   .point-check { margin-top: 10px; }
   .point-check dl { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; }
   .point-check dl div { display: block; }

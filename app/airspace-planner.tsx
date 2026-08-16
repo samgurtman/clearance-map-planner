@@ -2279,33 +2279,34 @@ export function AirspacePlanner() {
 
           <div className="screen-summary"><span><small>RED AREA</small><strong>{modelAvailable ? `${flaggedSquareMiles.toFixed(2)} mi²` : "—"}</strong></span><span><small>ACTIVE OBSTACLES</small><strong>{modelAvailable ? activeObstacles : "—"}</strong></span></div>
 
-          <a className="national-source" href="https://docs.overturemaps.org/guides/buildings/" target="_blank" rel="noreferrer">
-            <span className="source-kicker">AUTOMATIC NATIONAL LAYER · LIVE</span>
-            <strong>Overture Maps Buildings <b>↗</b></strong>
-            <span>PMTiles {overtureRelease} · footprints, heights, and building parts</span>
-          </a>
-          <a className="national-source terrain-source" href="https://registry.opendata.aws/terrain-tiles/" target="_blank" rel="noreferrer">
-            <span className="source-kicker">BARE-EARTH ELEVATION · AUTOMATIC</span>
-            <strong>Mapzen Terrain Tiles <b>↗</b></strong>
-            <span>Terrarium z{TERRAIN_TILE_ZOOM} · U.S. elevations sourced from USGS 3DEP/NED</span>
-          </a>
-          <a className="national-source water-source" href="https://docs.overturemaps.org/schema/reference/base/water/" target="_blank" rel="noreferrer">
-            <span className="source-kicker">OPEN-WATER MASK · AUTOMATIC</span>
-            <strong>Overture Maps Water <b>↗</b></strong>
-            <span>Permanent ocean and inland-water polygons · guarded shoreline classification</span>
-          </a>
-          <a className="national-source faa-source" href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/DailyDOF/" target="_blank" rel="noreferrer">
-            <span className="source-kicker">KNOWN AVIATION OBSTACLES · FAA SNAPSHOT</span>
-            <strong>FAA Daily DOF <b>↗</b></strong>
-            <span>{faaObstacleSnapshot || "Bundled current"} · verified and unverified records · published AMSL heights</span>
-          </a>
-
           <div className="panel-footer">
-            <button onClick={() => setDetailsOpen((current) => !current)}>{detailsOpen ? "Hide" : "Show"} model details <span>{detailsOpen ? "−" : "+"}</span></button>
-            {detailsOpen && <div className="model-details"><p>Red geometry combines conservative land/shoreline elevation cells with a 2,000-ft buffer around active Overture envelopes and FAA obstacle points. Confident open-water cells are omitted from the terrain mask, but modeled obstacles remain active. Overlapping conflicts are dissolved into one layer.</p><p><b>This model will never be fully accurate or complete.</b> Airspace, temporary restrictions, weather, vessels, people, vehicles, routes, takeoff/landing exceptions, and §91.119(a)/(c)/(d) conditions are not fully modeled.</p></div>}
+            <button aria-expanded={detailsOpen} aria-controls="model-details" onClick={() => setDetailsOpen((current) => !current)}>{detailsOpen ? "Hide" : "Show"} model details <span>{detailsOpen ? "−" : "+"}</span></button>
+            {detailsOpen && <div className="model-details" id="model-details">
+              <div className="model-layers-card"><span className="dataset-icon" aria-hidden="true">▤</span><span><small>{sourceMode === "overture" ? "AUTOMATIC MODEL LAYERS" : "LOCAL BUILDINGS + TERRAIN"}</small><strong>{datasetName}</strong><em>{dataNote}</em><em>{terrainNote}</em><em>{faaObstacleNote}</em></span>{sourceMode === "local" ? <button onClick={activateOverture}>Use Overture</button> : <span className={`data-live ${modelAvailable ? "" : "paused"}`}>{overlayUpdating ? "UPDATING" : modelAvailable ? "LIVE" : modelBadge}</span>}</div>
+              <p>Red geometry combines conservative land/shoreline elevation cells with a 2,000-ft buffer around active Overture envelopes and FAA obstacle points. Confident open-water cells are omitted from the terrain mask, but modeled obstacles remain active. Overlapping conflicts are dissolved into one layer.</p>
+              <p><b>This model will never be fully accurate or complete.</b> Airspace, temporary restrictions, weather, vessels, people, vehicles, routes, takeoff/landing exceptions, and §91.119(a)/(c)/(d) conditions are not fully modeled.</p>
+              <a className="national-source" href="https://docs.overturemaps.org/guides/buildings/" target="_blank" rel="noreferrer">
+                <span className="source-kicker">AUTOMATIC NATIONAL LAYER · LIVE</span>
+                <strong>Overture Maps Buildings <b>↗</b></strong>
+                <span>PMTiles {overtureRelease} · footprints, heights, and building parts</span>
+              </a>
+              <a className="national-source terrain-source" href="https://registry.opendata.aws/terrain-tiles/" target="_blank" rel="noreferrer">
+                <span className="source-kicker">BARE-EARTH ELEVATION · AUTOMATIC</span>
+                <strong>Mapzen Terrain Tiles <b>↗</b></strong>
+                <span>Terrarium z{TERRAIN_TILE_ZOOM} · U.S. elevations sourced from USGS 3DEP/NED</span>
+              </a>
+              <a className="national-source water-source" href="https://docs.overturemaps.org/schema/reference/base/water/" target="_blank" rel="noreferrer">
+                <span className="source-kicker">OPEN-WATER MASK · AUTOMATIC</span>
+                <strong>Overture Maps Water <b>↗</b></strong>
+                <span>Permanent ocean and inland-water polygons · guarded shoreline classification</span>
+              </a>
+              <a className="national-source faa-source" href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/DailyDOF/" target="_blank" rel="noreferrer">
+                <span className="source-kicker">KNOWN AVIATION OBSTACLES · FAA SNAPSHOT</span>
+                <strong>FAA Daily DOF <b>↗</b></strong>
+                <span>{faaObstacleSnapshot || "Bundled current"} · verified and unverified records · published AMSL heights</span>
+              </a>
+            </div>}
           </div>
-
-          <div className="model-layers-card"><span className="dataset-icon" aria-hidden="true">▤</span><span><small>{sourceMode === "overture" ? "AUTOMATIC MODEL LAYERS" : "LOCAL BUILDINGS + TERRAIN"}</small><strong>{datasetName}</strong><em>{dataNote}</em><em>{terrainNote}</em><em>{faaObstacleNote}</em></span>{sourceMode === "local" ? <button onClick={activateOverture}>Use Overture</button> : <span className={`data-live ${modelAvailable ? "" : "paused"}`}>{overlayUpdating ? "UPDATING" : modelAvailable ? "LIVE" : modelBadge}</span>}</div>
 
           <section className="tile-budget-panel" aria-label="Tile budget controls">
             <label className="tile-budget-control">
