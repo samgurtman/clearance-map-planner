@@ -179,6 +179,31 @@ export type GeographicArea = {
   polygons: number[][][][];
 };
 
+const SUPPORTED_US_DIVISION_CODES = new Set(["US", "AS", "GU", "MP", "PR", "UM", "VI"]);
+
+export function isSupportedUsTerritorialDivision(properties: Record<string, unknown>) {
+  const country = String(properties.country || "").trim().toUpperCase();
+  const subtype = String(properties.subtype || "").trim().toLowerCase();
+  const territorial = properties.is_territorial === true
+    || properties.is_territorial === "true"
+    || properties.is_territorial === 1;
+  return territorial
+    && SUPPORTED_US_DIVISION_CODES.has(country)
+    && (subtype === "country" || subtype === "dependency");
+}
+
+export function unsupportedGeographyCoordinates(areas: GeographicArea[]) {
+  const world: Geom = [[
+    [-179.999, 85],
+    [179.999, 85],
+    [179.999, -85],
+    [-179.999, -85],
+    [-179.999, 85],
+  ]];
+  if (!areas.length) return [world];
+  return differencePolygons(world, ...areas.map((area) => area.polygons as Geom));
+}
+
 function pointOnCoordinateSegment(longitude: number, latitude: number, start: number[], end: number[]) {
   const dx = end[0] - start[0];
   const dy = end[1] - start[1];

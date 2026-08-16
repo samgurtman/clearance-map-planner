@@ -11,8 +11,10 @@ import {
   ESTIMATED_FLOOR_HEIGHT_FT,
   faaUpperBoundAmslFt,
   highestTerrainElevationWithinRadius,
+  isSupportedUsTerritorialDivision,
   pointInGeographicAreas,
   shouldRetainOvertureBuildingPart,
+  unsupportedGeographyCoordinates,
 } from "../app/clearance-accuracy.ts";
 
 test("uses the requested commercial-floor estimate and known FAA vertical tolerance", () => {
@@ -62,39 +64,28 @@ test("can retain every Overture building part when grouping is disabled", () => 
   assert.equal(shouldRetainOvertureBuildingPart(true, false, false, false), true);
 });
 
-test("accepts U.S. locations and rejects unsupported locations", async () => {
-  const collection = JSON.parse(await readFile(new URL("../public/data/us-state-boundaries-5m.geojson", import.meta.url), "utf8"));
-  const areas = collection.features.map((feature) => {
-    const polygons = feature.geometry.type === "Polygon" ? [feature.geometry.coordinates] : feature.geometry.coordinates;
-    const coordinates = polygons.flat(2);
-    return {
-      west: Math.min(...coordinates.map(([longitude]) => longitude)),
-      east: Math.max(...coordinates.map(([longitude]) => longitude)),
-      south: Math.min(...coordinates.map(([, latitude]) => latitude)),
-      north: Math.max(...coordinates.map(([, latitude]) => latitude)),
-      polygons,
-    };
-  });
-  assert.equal(pointInGeographicAreas(-87.6324, 41.8819, areas), true);
-  assert.equal(pointInGeographicAreas(144.7937, 13.4443, areas), true);
-  assert.equal(pointInGeographicAreas(-79.3832, 43.6532, areas), false);
-  assert.equal(boundsWithinGeographicAreas({ west: -87.64, east: -87.62, south: 41.87, north: 41.89 }, areas), true);
-  assert.equal(boundsWithinGeographicAreas({ west: -79.39, east: -79.37, south: 43.64, north: 43.66 }, areas), false);
+test("uses only Overture territorial country and U.S. dependency polygons", () => {
+  assert.equal(isSupportedUsTerritorialDivision({ country: "US", subtype: "country", is_territorial: true }), true);
+  assert.equal(isSupportedUsTerritorialDivision({ country: "PR", subtype: "dependency", is_territorial: "true" }), true);
+  assert.equal(isSupportedUsTerritorialDivision({ country: "US", subtype: "region", is_territorial: true }), false);
+  assert.equal(isSupportedUsTerritorialDivision({ country: "US", subtype: "country", is_land: true }), false);
+  assert.equal(isSupportedUsTerritorialDivision({ country: "CA", subtype: "country", is_territorial: true }), false);
 });
 
-test("the unsupported-geography mask covers non-U.S. map space", async () => {
-  const collection = JSON.parse(await readFile(new URL("../public/data/us-unsupported-mask-5m.geojson", import.meta.url), "utf8"));
-  const feature = collection.features[0];
-  const coordinates = feature.geometry.coordinates.flat(2);
-  const maskArea = {
-    west: Math.min(...coordinates.map(([longitude]) => longitude)),
-    east: Math.max(...coordinates.map(([longitude]) => longitude)),
-    south: Math.min(...coordinates.map(([, latitude]) => latitude)),
-    north: Math.max(...coordinates.map(([, latitude]) => latitude)),
-    polygons: feature.geometry.coordinates,
-  };
-  assert.equal(pointInGeographicAreas(-79.3832, 43.6532, [maskArea]), true);
-  assert.equal(pointInGeographicAreas(-87.6324, 41.8819, [maskArea]), false);
+test("builds the gray unsupported mask as the inverse of territorial U.S. geometry", () => {
+  const areas = [{
+    west: -89,
+    east: -86,
+    south: 41,
+    north: 43,
+    polygons: [[[[-89, 43], [-86, 43], [-86, 41], [-89, 41], [-89, 43]]]],
+  }];
+  assert.equal(pointInGeographicAreas(-87.62, 41.9, areas), true);
+  assert.equal(boundsWithinGeographicAreas({ west: -87.65, east: -87.60, south: 41.87, north: 41.92 }, areas), true);
+  const unsupported = unsupportedGeographyCoordinates(areas);
+  const unsupportedArea = { west: -179.999, east: 179.999, south: -85, north: 85, polygons: unsupported };
+  assert.equal(pointInGeographicAreas(-79.3832, 43.6532, [unsupportedArea]), true);
+  assert.equal(pointInGeographicAreas(-87.62, 41.9, [unsupportedArea]), false);
 });
 
 test("the worker buffers terrain from the loaded 2,000-foot halo", async () => {

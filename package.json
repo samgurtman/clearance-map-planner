@@ -13,7 +13,6 @@
     "test": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build && node --experimental-strip-types --test tests/clearance-accuracy.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "data:faa": "node scripts/update-faa-obstacles.mjs",
-    "data:us-mask": "node scripts/build-us-unsupported-mask.mjs",
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {

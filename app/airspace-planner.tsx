@@ -21,9 +21,11 @@ import {
   ESTIMATED_FLOOR_HEIGHT_FT,
   faaUpperBoundAmslFt,
   highestTerrainElevationWithinRadius,
+  isSupportedUsTerritorialDivision,
   pointInGeographicArea,
   pointInGeographicAreas,
   shouldRetainOvertureBuildingPart,
+  unsupportedGeographyCoordinates,
 } from "./clearance-accuracy";
 import type { GeographicArea } from "./clearance-accuracy";
 
@@ -80,6 +82,7 @@ type TerrainStatus = "idle" | "loading" | "ready" | "zoom-required" | "error";
 type Basemap = "street" | "sectional";
 type UsMapRegionId = "lower48" | "alaska" | "western-aleutians" | "hawaii" | "caribbean" | "western-pacific" | "american-samoa";
 type FaaObstacleStatus = "idle" | "loading" | "ready" | "error";
+type UsBoundaryStatus = "loading" | "ready" | "error";
 type FaaObstacleRow = [id: string, lat: number, lon: number, type: string, aglFt: number, amslFt: number, verified: string, accuracy: string];
 type FaaObstacleManifest = {
   schemaVersion: number;
@@ -99,10 +102,7 @@ const OVERTURE_CATALOG_URL = "https://stac.overturemaps.org/catalog.json";
 const FAA_SECTIONAL_TILE_URL = "https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer/tile/{z}/{y}/{x}";
 const FAA_TERMINAL_TILE_URL = "https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Terminal/MapServer/tile/{z}/{y}/{x}";
 const TERRAIN_TILE_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
-// Bundled U.S. Census TIGERweb States 5M geometry keeps the geographic guard
-// available offline and under the same GitHub Pages base path as the app.
-const US_BOUNDARY_DATA_URL = "./data/us-state-boundaries-5m.geojson";
-const US_UNSUPPORTED_MASK_DATA_URL = "./data/us-unsupported-mask-5m.geojson";
+const OVERTURE_DIVISION_TILE_ZOOM = 6;
 // Relative to the document so repository-scoped GitHub Pages URLs keep the
 // bundled FAA shards under the same base path.
 const FAA_OBSTACLE_DATA_ROOT = "./data/faa-obstacles";
@@ -161,7 +161,6 @@ let overtureMemoryTileCacheBytes = 0;
 let overtureTileCacheDatabase: Promise<IDBDatabase | null> | null = null;
 let overturePersistentWriteTimer: ReturnType<typeof setTimeout> | null = null;
 let faaObstacleManifestRequest: Promise<FaaObstacleManifest> | null = null;
-let usBoundaryRequest: Promise<GeographicArea[]> | null = null;
 
 function rememberTerrainTile(key: string, summary: TerrainTileSummary) {
   terrainMemoryTileCache.delete(key);
@@ -221,26 +220,6 @@ async function decodeTerrainTile(data: ArrayBuffer, zoom: number, x: number, y: 
   return { cells };
 }
 
-async function loadUsBoundaryAreas() {
-  if (!usBoundaryRequest) {
-    usBoundaryRequest = fetch(US_BOUNDARY_DATA_URL)
-      .then(async (response) => {
-        if (!response.ok) throw new Error(`U.S. boundary data returned HTTP ${response.status}.`);
-        const collection = await response.json() as FeatureCollection<Polygon | MultiPolygon>;
-        const areas = collection.features
-          .filter((feature) => feature.geometry?.type === "Polygon" || feature.geometry?.type === "MultiPolygon")
-          .map((feature) => geographicAreaFromFeature(feature));
-        if (!areas.length) throw new Error("U.S. boundary data contains no usable polygons.");
-        return areas;
-      })
-      .catch((error) => {
-        usBoundaryRequest = null;
-        throw error;
-      });
-  }
-  return usBoundaryRequest;
-}
-
 async function loadTerrainTile(zoom: number, x: number, y: number) {
   const key = `${zoom}/${x}/${y}`;
   const cached = terrainMemoryTileCache.get(key);
@@ -293,6 +272,21 @@ function geographicAreaFromFeature(feature: Feature<Polygon | MultiPolygon>): Ge
     bounds.north = Math.max(bounds.north, latitude);
   })));
   return { ...bounds, polygons };
+}
+
+function overtureUsBoundaryTileCoordinates(zoom: number) {
+  const coordinates = new Map<string, { x: number; y: number }>();
+  const maxTile = (2 ** zoom) - 1;
+  Object.values(US_MAP_REGIONS).forEach((region) => {
+    const minimumX = Math.max(0, Math.min(maxTile, tileX(region.bounds[0][0], zoom)));
+    const maximumX = Math.max(0, Math.min(maxTile, tileX(region.bounds[1][0], zoom)));
+    const minimumY = Math.max(0, Math.min(maxTile, tileY(region.bounds[1][1], zoom)));
+    const maximumY = Math.max(0, Math.min(maxTile, tileY(region.bounds[0][1], zoom)));
+    for (let x = minimumX; x <= maximumX; x += 1) {
+      for (let y = minimumY; y <= maximumY; y += 1) coordinates.set(`${x}/${y}`, { x, y });
+    }
+  });
+  return [...coordinates.values()];
 }
 
 const openWaterAreaFromFeature = geographicAreaFromFeature;
@@ -1162,6 +1156,7 @@ export function AirspacePlanner() {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [mapReady, setMapReady] = useState(false);
   const [usBoundaryAreas, setUsBoundaryAreas] = useState<GeographicArea[]>([]);
+  const [usBoundaryStatus, setUsBoundaryStatus] = useState<UsBoundaryStatus>("loading");
   const [basemapError, setBasemapError] = useState(false);
   const [basemap, setBasemap] = useState<Basemap>("street");
   const [mapRegion, setMapRegion] = useState<UsMapRegionId>("lower48");
@@ -1385,11 +1380,11 @@ export function AirspacePlanner() {
       import("pmtiles"),
       import("@mapbox/vector-tile"),
       import("pbf"),
-      loadUsBoundaryAreas(),
-    ]).then(([maplibregl, { PMTiles }, { VectorTile }, { PbfReader }, supportedUsAreas]) => {
+    ]).then(([maplibregl, { PMTiles }, { VectorTile }, { PbfReader }]) => {
       if (disposed || !mapContainerRef.current) return;
-      setUsBoundaryAreas(supportedUsAreas);
       maplibregl.setWorkerUrl(maplibreWorkerUrl);
+      let supportedUsAreas: GeographicArea[] = [];
+      let unsupportedUsGeoJson: FeatureCollection<Polygon | MultiPolygon> = featureCollection([]);
       let release = OVERTURE_FALLBACK_RELEASE;
       let archive = new PMTiles(`https://overturemaps-extras-us-west-2.s3.us-west-2.amazonaws.com/tiles/${release}/buildings.pmtiles`);
       let waterArchive = new PMTiles(`https://overturemaps-extras-us-west-2.s3.us-west-2.amazonaws.com/tiles/${release}/base.pmtiles`);
@@ -1397,15 +1392,16 @@ export function AirspacePlanner() {
       setOvertureRelease(release);
       setDatasetName(`Overture Maps · ${release}`);
       void catalogPromise.then((catalog) => {
-        if (disposed || typeof catalog?.latest !== "string" || catalog.latest === release) return;
-        release = catalog.latest;
-        archive = new PMTiles(`https://overturemaps-extras-us-west-2.s3.us-west-2.amazonaws.com/tiles/${release}/buildings.pmtiles`);
-        waterArchive = new PMTiles(`https://overturemaps-extras-us-west-2.s3.us-west-2.amazonaws.com/tiles/${release}/base.pmtiles`);
-        setOvertureRelease(release);
-        setDatasetName(`Overture Maps · ${release}`);
-        void archive.getHeader().then((header) => {
-          fullTileZoom = header.maxZoom;
-        }).catch(() => undefined);
+        if (!disposed && typeof catalog?.latest === "string" && catalog.latest !== release) {
+          release = catalog.latest;
+          archive = new PMTiles(`https://overturemaps-extras-us-west-2.s3.us-west-2.amazonaws.com/tiles/${release}/buildings.pmtiles`);
+          waterArchive = new PMTiles(`https://overturemaps-extras-us-west-2.s3.us-west-2.amazonaws.com/tiles/${release}/base.pmtiles`);
+          setOvertureRelease(release);
+          setDatasetName(`Overture Maps · ${release}`);
+          void archive.getHeader().then((header) => {
+            fullTileZoom = header.maxZoom;
+          }).catch(() => undefined);
+        }
       });
       const map = new maplibregl.Map({
         container: mapContainerRef.current,
@@ -1452,6 +1448,50 @@ export function AirspacePlanner() {
         attributionControl: { customAttribution: '<a href="https://registry.opendata.aws/terrain-tiles/" target="_blank">Terrain © Mapzen · USGS 3DEP</a>' },
       });
       mapRef.current = map;
+
+      void (async () => {
+        if (disposed) return;
+        const boundaryRelease = OVERTURE_FALLBACK_RELEASE;
+        const divisionsArchive = new PMTiles(`https://overturemaps-extras-us-west-2.s3.us-west-2.amazonaws.com/tiles/${boundaryRelease}/divisions.pmtiles`);
+        const coordinates = overtureUsBoundaryTileCoordinates(OVERTURE_DIVISION_TILE_ZOOM);
+        const tiles = await mapWithConcurrency(coordinates, OVERTURE_FETCH_CONCURRENCY, async ({ x, y }) => ({
+          x,
+          y,
+          tile: await loadCachedOvertureTile(
+            `divisions:${boundaryRelease}:${OVERTURE_DIVISION_TILE_ZOOM}/${x}/${y}`,
+            async () => (await divisionsArchive.getZxy(OVERTURE_DIVISION_TILE_ZOOM, x, y))?.data || null,
+          ),
+        }));
+        if (disposed) return;
+        const areas: GeographicArea[] = [];
+        tiles.forEach(({ x, y, tile }) => {
+          if (!tile) return;
+          const vectorTile = new VectorTile(new PbfReader(new Uint8Array(tile)));
+          const layer = vectorTile.layers.division_area;
+          if (!layer) return;
+          for (let index = 0; index < layer.length; index += 1) {
+            const vectorFeature = layer.feature(index);
+            const properties = (vectorFeature.properties || {}) as Record<string, unknown>;
+            if (!isSupportedUsTerritorialDivision(properties)) continue;
+            const geojson = vectorFeature.toGeoJSON(x, y, OVERTURE_DIVISION_TILE_ZOOM);
+            if (geojson.geometry.type !== "Polygon" && geojson.geometry.type !== "MultiPolygon") continue;
+            areas.push(geographicAreaFromFeature(geojson as Feature<Polygon | MultiPolygon>));
+          }
+        });
+        if (!areas.length) throw new Error("Overture returned no supported U.S. territorial polygons.");
+        supportedUsAreas = areas;
+        unsupportedUsGeoJson = featureCollection([
+          multiPolygon(unsupportedGeographyCoordinates(areas), { classification: "outside-supported-us-boundary" }),
+        ]);
+        setUsBoundaryAreas(areas);
+        setUsBoundaryStatus("ready");
+        (map.getSource("unsupported-geography") as GeoJSONSource | undefined)?.setData(unsupportedUsGeoJson);
+      })().catch((error) => {
+        console.error("U.S. territorial boundary loading failed", error);
+        if (disposed) return;
+        setUsBoundaryStatus("error");
+        setRenderError("The U.S. country boundary could not be loaded. Reload to try again.");
+      });
 
       const loadVisibleTerrainTiles = async (selection: RenderBounds, onProgress?: (value: number) => void) => {
         const requestRelease = release;
@@ -1839,8 +1879,12 @@ export function AirspacePlanner() {
       };
 
       renderAreaRef.current = async (selection: RenderBounds) => {
+        if (!supportedUsAreas.length) {
+          setRenderError("The U.S. country boundary is still loading. Try again in a moment.");
+          return false;
+        }
         if (!boundsWithinGeographicAreas(selection, supportedUsAreas)) {
-          setRenderError("The Model Area must stay entirely within a supported U.S. state or territory boundary.");
+          setRenderError("The Model Area must stay entirely within the supported U.S. territorial boundary.");
           return false;
         }
         const renderId = ++areaRenderSerial;
@@ -1976,7 +2020,11 @@ export function AirspacePlanner() {
               fullTileZoom = header.maxZoom;
             }).catch(() => undefined);
             const beforeId = map.getStyle().layers?.find((layer) => layer.type === "symbol")?.id;
-            map.addSource("unsupported-geography", { type: "geojson", data: US_UNSUPPORTED_MASK_DATA_URL });
+            map.addSource("unsupported-geography", {
+              type: "geojson",
+              data: unsupportedUsGeoJson,
+              attribution: '<a href="https://docs.overturemaps.org/schema/reference/divisions/division_area/" target="_blank">© Overture Maps Foundation</a>',
+            });
             map.addSource("overture-buildings", { type: "geojson", data: emptyFeatures(), maxzoom: 14, tolerance: 0.5, attribution: '<a href="https://docs.overturemaps.org/attribution" target="_blank">© Overture Maps Foundation</a>' });
             map.addSource("clearance-zones", { type: "geojson", data: emptyFeatures() });
             map.addSource("clearance-conflicts", { type: "geojson", data: emptyFeatures(), maxzoom: 14, tolerance: 0.25 });
@@ -2013,8 +2061,12 @@ export function AirspacePlanner() {
       let suppressNextClick = false;
       map.on("mousedown", (event) => {
         if (!drawingAreaRef.current) return;
+        if (!supportedUsAreas.length) {
+          setRenderError("The U.S. country boundary is still loading. Try again in a moment.");
+          return;
+        }
         if (!pointInGeographicAreas(event.lngLat.lng, event.lngLat.lat, supportedUsAreas)) {
-          setRenderError("Start the Model Area inside a supported U.S. state or territory boundary.");
+          setRenderError("Start the Model Area inside the supported U.S. territorial boundary.");
           return;
         }
         event.preventDefault();
@@ -2160,7 +2212,7 @@ export function AirspacePlanner() {
       if (!imported.buildings.length) throw new Error("No usable building records were found.");
       if (!usBoundaryAreas.length) throw new Error("The U.S. boundary guard is still loading. Try the import again in a moment.");
       if (!buildingsWithinGeographicAreas(imported.buildings, imported.origin, usBoundaryAreas)) {
-        throw new Error("Imported buildings must be inside a supported U.S. state or territory boundary.");
+        throw new Error("Imported buildings must be inside the supported U.S. territorial boundary.");
       }
       const importedRegion = mapRegionForLocation(imported.origin.lon, imported.origin.lat);
       if (!importedRegion) throw new Error("The imported location is outside the supported U.S. map regions.");
@@ -2247,6 +2299,12 @@ export function AirspacePlanner() {
 
   function beginAreaSelection() {
     if (!mapReady || renderProgress.active) return;
+    if (usBoundaryStatus !== "ready") {
+      setRenderError(usBoundaryStatus === "error"
+        ? "The U.S. country boundary is unavailable. Reload to try again."
+        : "The U.S. country boundary is still loading. Try again in a moment.");
+      return;
+    }
     setRenderError("");
     setDrawingArea((current) => !current);
     selectionStartRef.current = null;
@@ -2254,6 +2312,12 @@ export function AirspacePlanner() {
 
   function useCurrentView() {
     if (!mapRef.current || renderProgress.active) return;
+    if (usBoundaryStatus !== "ready") {
+      setRenderError(usBoundaryStatus === "error"
+        ? "The U.S. country boundary is unavailable. Reload to try again."
+        : "The U.S. country boundary is still loading. Try again in a moment.");
+      return;
+    }
     const viewBounds = mapViewportBounds(mapRef.current);
     if (!boundsWithinGeographicAreas(viewBounds, usBoundaryAreas)) {
       setRenderError("The current view crosses outside the supported U.S. boundary. Zoom in or move the map.");
@@ -2267,8 +2331,14 @@ export function AirspacePlanner() {
 
   async function renderSelectedArea() {
     if (!selectedBounds || renderProgress.active) return;
+    if (usBoundaryStatus !== "ready") {
+      setRenderError(usBoundaryStatus === "error"
+        ? "The U.S. country boundary is unavailable. Reload to try again."
+        : "The U.S. country boundary is still loading. Try again in a moment.");
+      return;
+    }
     if (!boundsWithinGeographicAreas(selectedBounds, usBoundaryAreas)) {
-      setRenderError("The Model Area must stay entirely within a supported U.S. state or territory boundary.");
+      setRenderError("The Model Area must stay entirely within the supported U.S. territorial boundary.");
       return;
     }
     setDrawingArea(false);
@@ -2391,7 +2461,11 @@ export function AirspacePlanner() {
     && selectedBounds.east - selectedBounds.west > 0.000001
     && selectedBounds.north - selectedBounds.south > 0.000001
     && selectionIsWithinUs);
-  const selectionLabel = drawingArea
+  const selectionLabel = usBoundaryStatus === "loading"
+    ? "Loading U.S. territorial boundary…"
+    : usBoundaryStatus === "error"
+      ? "U.S. territorial boundary unavailable"
+    : drawingArea
     ? "Drag across the map to draw a box"
     : selectedBounds && !selectionIsWithinUs
       ? "Selection crosses outside the supported U.S. boundary"
@@ -2475,6 +2549,11 @@ export function AirspacePlanner() {
                 <span className="source-kicker">OPEN-WATER MASK · AUTOMATIC</span>
                 <strong>Overture Maps Water <b>↗</b></strong>
                 <span>PMTiles z{WATER_TILE_ZOOM} · permanent ocean and inland-water polygons · guarded shoreline classification</span>
+              </a>
+              <a className="national-source" href="https://docs.overturemaps.org/schema/reference/divisions/division_area/" target="_blank" rel="noreferrer">
+                <span className="source-kicker">SUPPORTED U.S. BOUNDARY · AUTOMATIC</span>
+                <strong>Overture Maps Divisions <b>↗</b></strong>
+                <span>PMTiles z{OVERTURE_DIVISION_TILE_ZOOM} · territorial country and U.S. dependency polygons · {usBoundaryStatus.toUpperCase()}</span>
               </a>
               <a className="national-source faa-source" href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/DailyDOF/" target="_blank" rel="noreferrer">
                 <span className="source-kicker">KNOWN AVIATION OBSTACLES · FAA SNAPSHOT</span>
@@ -2565,7 +2644,7 @@ export function AirspacePlanner() {
           <p>Terrain tiles are divided into 64×64-pixel cells. Each land or shoreline cell uses its highest DEM pixel, and terrain conflicts expand 2,000 feet horizontally just like obstacle envelopes. Invalid, out-of-range, or incomplete Terrarium tiles stop the model instead of producing a clearance result. Open water uses guarded z{WATER_TILE_ZOOM} Overture geometry; uncertain and intermittent-water cells remain terrain.</p>
           <p>Over open water, §91.119(c) does not prescribe a fixed height above the water surface, but it still restricts proximity to people, vessels, vehicles, and structures, and §91.119(a) still applies. This model preserves building and FAA-obstacle screening but does not know real-time vessel, vehicle, or person locations.</p>
           <p>Building and terrain evaluation use fixed full-detail tiles independent of camera zoom. Building floor counts use a conservative {ESTIMATED_FLOOR_HEIGHT_FT}-foot-per-floor estimate, while buildings with no height information retain the 30-foot fallback. Each render includes a 2,000-ft halo around the selected box; the selectable tile budget is currently {tileBudget} tiles.</p>
-          <p>Mapping, imports, selected-point checks, and Model Areas are restricted to U.S. states and territories using a bundled generalized U.S. Census boundary. Select a U.S. region from the map control before drawing an area.</p>
+          <p>Mapping, imports, selected-point checks, and Model Areas are restricted with Overture Maps territorial country and U.S. dependency polygons. Unlike state shoreline polygons, the mask includes Overture’s best approximation of maritime jurisdiction, including the U.S. portions of the Great Lakes. Select a U.S. region from the map control before drawing an area.</p>
           <p>The rendered result remains fixed while you pan or zoom and changes only when you press Re-render. The FAA evaluates whether an area is “congested” case by case, so the selected box is treated as a conservative study area—not labeled as an official FAA boundary.</p>
           <div className="modal-warning"><b>Small UAS note</b><span>Part 107 generally uses a different 400-foot AGL framework and may require airspace authorization. This prototype models the Part 91 rule named above.</span></div>
           <div className="source-detail">
@@ -2589,7 +2668,7 @@ export function AirspacePlanner() {
             <a href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/DailyDOF/" target="_blank" rel="noreferrer">Open FAA Daily DOF ↗</a>
           </div>
           <div className="file-help"><h3>Advanced local override</h3><p>GeoJSON: use <code>height_ft</code>, Overture <code>height</code> (meters), <code>height_m</code>, <code>num_floors</code>, or <code>building:levels</code>. Floating features may also provide <code>min_height</code> or <code>min_floor</code>. CSV: include <code>lat, lon, height_ft, width_ft, depth_ft</code>.</p><div className="file-actions"><button onClick={() => inputRef.current?.click()}>Import local file</button><button onClick={downloadTemplate}>Download CSV template</button>{sourceMode === "local" && <button onClick={activateOverture}>Return to Overture</button>}</div></div>
-          <div className="modal-links"><a href="https://www.faa.gov/about/office_org/field_offices/fsdo/anf" target="_blank" rel="noreferrer">FAA §91.119 overview ↗</a><a href="https://www.faa.gov/about/office_org/headquarters_offices/agc/practice_areas/regulations/interpretations/Data/interps/2009/Anderson_2009_Legal_Interpretation.pdf" target="_blank" rel="noreferrer">FAA Anderson interpretation ↗</a><a href="https://www.usgs.gov/3d-elevation-program" target="_blank" rel="noreferrer">USGS 3DEP ↗</a><a href="https://tigerweb.geo.census.gov/arcgis/rest/services/Generalized_ACS2024/State_County/MapServer" target="_blank" rel="noreferrer">U.S. Census boundary ↗</a><a href="https://carto.com/basemaps/" target="_blank" rel="noreferrer">Street basemap ↗</a><a href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/vfr/" target="_blank" rel="noreferrer">FAA chart sources ↗</a></div>
+          <div className="modal-links"><a href="https://www.faa.gov/about/office_org/field_offices/fsdo/anf" target="_blank" rel="noreferrer">FAA §91.119 overview ↗</a><a href="https://www.faa.gov/about/office_org/headquarters_offices/agc/practice_areas/regulations/interpretations/Data/interps/2009/Anderson_2009_Legal_Interpretation.pdf" target="_blank" rel="noreferrer">FAA Anderson interpretation ↗</a><a href="https://www.usgs.gov/3d-elevation-program" target="_blank" rel="noreferrer">USGS 3DEP ↗</a><a href="https://docs.overturemaps.org/schema/reference/divisions/division_area/" target="_blank" rel="noreferrer">Overture territorial boundary ↗</a><a href="https://carto.com/basemaps/" target="_blank" rel="noreferrer">Street basemap ↗</a><a href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/vfr/" target="_blank" rel="noreferrer">FAA chart sources ↗</a></div>
         </section>
       </div>}
     </main>
