@@ -2283,8 +2283,6 @@ export function AirspacePlanner() {
             <button aria-expanded={detailsOpen} aria-controls="model-details" onClick={() => setDetailsOpen((current) => !current)}>{detailsOpen ? "Hide" : "Show"} model details <span>{detailsOpen ? "−" : "+"}</span></button>
             {detailsOpen && <div className="model-details" id="model-details">
               <div className="model-layers-card"><span className="dataset-icon" aria-hidden="true">▤</span><span><small>{sourceMode === "overture" ? "AUTOMATIC MODEL LAYERS" : "LOCAL BUILDINGS + TERRAIN"}</small><strong>{datasetName}</strong><em>{dataNote}</em><em>{terrainNote}</em><em>{faaObstacleNote}</em></span>{sourceMode === "local" ? <button onClick={activateOverture}>Use Overture</button> : <span className={`data-live ${modelAvailable ? "" : "paused"}`}>{overlayUpdating ? "UPDATING" : modelAvailable ? "LIVE" : modelBadge}</span>}</div>
-              <p>Red geometry combines conservative land/shoreline elevation cells with a 2,000-ft buffer around active Overture envelopes and FAA obstacle points. Confident open-water cells are omitted from the terrain mask, but modeled obstacles remain active. Overlapping conflicts are dissolved into one layer.</p>
-              <p><b>This model will never be fully accurate or complete.</b> Airspace, temporary restrictions, weather, vessels, people, vehicles, routes, takeoff/landing exceptions, and §91.119(a)/(c)/(d) conditions are not fully modeled.</p>
               <a className="national-source" href="https://docs.overturemaps.org/guides/buildings/" target="_blank" rel="noreferrer">
                 <span className="source-kicker">AUTOMATIC NATIONAL LAYER · LIVE</span>
                 <strong>Overture Maps Buildings <b>↗</b></strong>
