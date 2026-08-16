@@ -63,13 +63,13 @@ let buildings: Building[] = [];
 let groupedBuildings: Building[] = [];
 let sortedBuildingThresholds: number[] = [];
 let screenedTerrainCells: TerrainCell[] = [];
+let screenedRenderedTerrainCells: TerrainCell[] = [];
 let hasOpenWaterCells = false;
 let zones: Zone[] = [];
 let origin: Origin = { lat: 0, lon: 0 };
 let renderedBounds: RenderBounds = { west: 0, east: 0, south: 0, north: 0 };
 let zoneFeatures: Array<Feature<Polygon>> = [];
 const bufferedBuildingCache = new Map<string, Feature<Polygon | MultiPolygon> | null>();
-const buildingConflictBoundsCache = new Map<string, CoordinateBounds>();
 const resultCache = new Map<number, ConflictResult>();
 
 const feetPerLonDegree = (latitude: number) => 364_000 * Math.cos((latitude * Math.PI) / 180);
@@ -175,10 +175,10 @@ function compactTerrainFeatures(activeCells: TerrainCell[]) {
     let runStart = cells[0];
     let runEnd = cells[0];
     const emitRun = () => {
-      const west = Math.max(renderedBounds.west, runStart.west);
-      const east = Math.min(renderedBounds.east, runEnd.east);
-      const north = Math.min(renderedBounds.north, runStart.north);
-      const south = Math.max(renderedBounds.south, runStart.south);
+      const west = runStart.west;
+      const east = runEnd.east;
+      const north = runStart.north;
+      const south = runStart.south;
       if (west >= east || south >= north) return;
       features.push(polygon([[
         [west, north],
@@ -205,61 +205,19 @@ function compactTerrainFeatures(activeCells: TerrainCell[]) {
   return features;
 }
 
-type CoordinateBounds = { west: number; east: number; south: number; north: number };
-
-function featureBounds(feature: Feature<Polygon | MultiPolygon>): CoordinateBounds {
-  const polygons = feature.geometry.type === "Polygon"
-    ? [feature.geometry.coordinates]
-    : feature.geometry.coordinates;
-  const bounds = { west: Infinity, east: -Infinity, south: Infinity, north: -Infinity };
-  polygons.forEach((rings) => rings.forEach((ring) => ring.forEach(([longitude, latitude]) => {
-    bounds.west = Math.min(bounds.west, longitude);
-    bounds.east = Math.max(bounds.east, longitude);
-    bounds.south = Math.min(bounds.south, latitude);
-    bounds.north = Math.max(bounds.north, latitude);
-  })));
-  return bounds;
-}
-
-function featureCoveredByTerrain(feature: Feature<Polygon | MultiPolygon>, terrainBounds: CoordinateBounds[]) {
-  const bounds = featureBounds(feature);
-  return boundsCoveredByTerrain(bounds, terrainBounds);
-}
-
-function boundsCoveredByTerrain(bounds: CoordinateBounds, terrainBounds: CoordinateBounds[]) {
-  const tolerance = 1e-10;
-  return terrainBounds.some((terrain) => bounds.west >= terrain.west - tolerance
-    && bounds.east <= terrain.east + tolerance
-    && bounds.south >= terrain.south - tolerance
-    && bounds.north <= terrain.north + tolerance);
-}
-
-function buildingConflictBounds(building: Building): CoordinateBounds {
-  const cached = buildingConflictBoundsCache.get(building.id);
-  if (cached) return cached;
-  const padding = CLEARANCE_DISTANCE_FT * 1.05 + 5;
-  let minX = Infinity;
-  let maxX = -Infinity;
-  let minY = Infinity;
-  let maxY = -Infinity;
-  building.envelopes.forEach((envelope) => envelope.forEach((value) => {
-    minX = Math.min(minX, value.x);
-    maxX = Math.max(maxX, value.x);
-    minY = Math.min(minY, value.y);
-    maxY = Math.max(maxY, value.y);
-  }));
-  minX -= padding;
-  maxX += padding;
-  minY -= padding;
-  maxY += padding;
-  const bounds = {
-    west: localToLngLat({ x: minX, y: 0 })[0],
-    east: localToLngLat({ x: maxX, y: 0 })[0],
-    north: localToLngLat({ x: 0, y: minY })[1],
-    south: localToLngLat({ x: 0, y: maxY })[1],
-  };
-  buildingConflictBoundsCache.set(building.id, bounds);
-  return bounds;
+function bufferedTerrainConflictFeatures(activeCells: TerrainCell[]) {
+  const compacted = compactTerrainFeatures(activeCells);
+  const baseMask = dissolveFeatures(compacted);
+  const clippedFeatures: Array<Feature<Polygon | MultiPolygon>> = [];
+  baseMask.features.forEach((feature) => {
+    const expanded = buffer(feature, CLEARANCE_DISTANCE_FT, { units: "feet", steps: 8 });
+    if (!expanded) return;
+    zoneFeatures.forEach((studyZone) => {
+      const clipped = intersect(featureCollection([expanded, studyZone]));
+      if (clipped) clippedFeatures.push(clipped);
+    });
+  });
+  return clippedFeatures;
 }
 
 function bufferedConflictFeature(building: Building) {
@@ -378,7 +336,11 @@ function computeConflicts(requestId: number, altitudeFt: number): ConflictResult
     });
   const activeTerrainCells = screenedTerrainCells
     .filter((cell) => altitudeFt < cell.elevationFt + 1000);
-  if (!hasOpenWaterCells && screenedTerrainCells.length > 0 && activeTerrainCells.length === screenedTerrainCells.length) {
+  const activeRenderedTerrainCellCount = screenedRenderedTerrainCells
+    .filter((cell) => altitudeFt < cell.elevationFt + 1000).length;
+  if (!hasOpenWaterCells
+    && screenedRenderedTerrainCells.length > 0
+    && activeRenderedTerrainCellCount === screenedRenderedTerrainCells.length) {
     postProgress(requestId, 0.9, "Surface mask covers the selected area");
     const conflicts = featureCollection(zoneFeatures);
     const areaSquareMeters = conflicts.features.reduce((sum, feature) => sum + featureArea(feature), 0);
@@ -390,15 +352,13 @@ function computeConflicts(requestId: number, altitudeFt: number): ConflictResult
     rememberResult(altitudeFt, result);
     return result;
   }
-  const terrainFeatures = compactTerrainFeatures(activeTerrainCells);
-  const terrainBounds = terrainFeatures.map(featureBounds);
+  const terrainFeatures = bufferedTerrainConflictFeatures(activeTerrainCells);
   const buildingFeatures: Array<Feature<Polygon | MultiPolygon>> = [];
 
   postProgress(requestId, 0.35, "Preparing building and FAA obstacle envelopes");
   displayBuildings.forEach((building) => {
-    if (boundsCoveredByTerrain(buildingConflictBounds(building), terrainBounds)) return;
     const feature = bufferedConflictFeature(building);
-    if (feature && !featureCoveredByTerrain(feature, terrainBounds)) buildingFeatures.push(feature);
+    if (feature) buildingFeatures.push(feature);
   });
 
   postProgress(requestId, 0.72, "Dissolving overlap into one shade");
@@ -433,10 +393,10 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
       renderedBounds = message.renderedBounds;
       const renderedTerrainCells = message.terrainCells.filter(terrainCellIntersectsBounds);
       hasOpenWaterCells = renderedTerrainCells.some((cell) => cell.openWater);
-      screenedTerrainCells = renderedTerrainCells.filter((cell) => !cell.openWater);
+      screenedRenderedTerrainCells = renderedTerrainCells.filter((cell) => !cell.openWater);
+      screenedTerrainCells = message.terrainCells.filter((cell) => !cell.openWater);
       zoneFeatures = zones.map(zoneFeature);
       bufferedBuildingCache.clear();
-      buildingConflictBoundsCache.clear();
       resultCache.clear();
     }
     const result = computeConflicts(message.requestId, message.altitudeFt);

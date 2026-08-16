@@ -10,9 +10,10 @@
     "build": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build",
     "build:pages": "GITHUB_PAGES=true vinext build && node scripts/prepare-github-pages.mjs",
     "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
-    "test": "npm run build && node --test tests/rendered-html.test.mjs",
+    "test": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build && node --experimental-strip-types --test tests/clearance-accuracy.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "data:faa": "node scripts/update-faa-obstacles.mjs",
+    "data:us-mask": "node scripts/build-us-unsupported-mask.mjs",
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {

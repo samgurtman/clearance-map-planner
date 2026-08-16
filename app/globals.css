@@ -144,6 +144,8 @@ button { color: inherit; }
 .basemap-switch button { min-height: 35px; border: 0; border-right: 1px solid var(--line); padding: 0 11px; background: transparent; color: #657075; font-size: 8px; font-weight: 900; letter-spacing: .06em; text-transform: uppercase; cursor: pointer; }
 .basemap-switch button:last-child { border-right: 0; }
 .basemap-switch button.active { background: var(--ink); color: white; }
+.region-switch { position: absolute; z-index: 2; right: 65px; top: 61px; display: flex; align-items: center; gap: 7px; min-height: 35px; padding: 0 9px; border: 1px solid rgba(24,34,41,.18); background: rgba(255,253,247,.94); box-shadow: 0 8px 22px rgba(38,42,42,.08); color: #657075; font-size: 8px; font-weight: 900; letter-spacing: .06em; text-transform: uppercase; }
+.region-switch select { max-width: 145px; border: 0; background: transparent; color: var(--ink); font: inherit; cursor: pointer; outline-offset: 3px; }
 .model-area-toolbar { position: absolute; z-index: 3; top: 18px; left: 18px; width: min(345px, calc(100% - 220px)); padding: 12px; border: 1px solid rgba(24,34,41,.2); background: rgba(255,253,247,.95); backdrop-filter: blur(12px); box-shadow: 0 10px 28px rgba(38,42,42,.12); }
 .model-area-copy { display: flex; flex-direction: column; gap: 4px; }
 .model-area-copy small { color: #858b8d; font-size: 7px; font-weight: 900; letter-spacing: .14em; }
@@ -188,6 +190,7 @@ button { color: inherit; }
 .legend-blue { background: rgba(39,111,158,.12); border: 1px dashed #276f9e; }
 .legend-building { background: #4f595e; }
 .legend-faa { background: #72231d; border: 2px solid #fffdf7; border-radius: 50%; box-shadow: 0 0 0 1px #72231d; }
+.legend-unsupported { background: rgba(114,120,122,.72); border: 1px solid #51585b; }
 .model-layers-card { width: 100%; margin-top: 12px; display: flex; align-items: center; gap: 11px; padding: 12px; background: #f8f7f1; border: 1px solid rgba(24,34,41,.18); }
 .dataset-icon { width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid var(--line); font-size: 15px; }
 .model-layers-card > span:nth-child(2) { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
@@ -197,6 +200,12 @@ button { color: inherit; }
 .model-layers-card button { margin-left: auto; border: 0; border-bottom: 1px solid var(--ink); background: transparent; padding: 2px 0; font-size: 8px; font-weight: 900; text-transform: uppercase; cursor: pointer; }
 .data-live { margin-left: auto; color: var(--clear); font-size: 8px; font-weight: 900; letter-spacing: .13em; }
 .data-live.paused { color: var(--amber); }
+.building-parts-option { display: flex; align-items: flex-start; gap: 10px; margin-top: 8px; padding: 11px 12px; border: 1px solid var(--line); background: #f7f5ee; cursor: pointer; }
+.building-parts-option input { width: 15px; height: 15px; flex: 0 0 15px; margin: 1px 0 0; accent-color: var(--signal); cursor: pointer; }
+.building-parts-option input:disabled { cursor: wait; opacity: .5; }
+.building-parts-option > span { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.building-parts-option strong { color: var(--ink); font-size: 9px; }
+.building-parts-option small { color: #747b7e; font-size: 8px; line-height: 1.4; }
 .basemap-badge { position: absolute; z-index: 2; bottom: 28px; right: 125px; font-size: 7px; font-weight: 800; letter-spacing: .08em; color: #687073; background: rgba(255,253,247,.82); padding: 5px 7px; }
 
 .national-source { display: flex; flex-direction: column; gap: 4px; margin-top: 16px; padding: 12px; border: 1px solid var(--line); background: #f2f1eb; color: var(--ink); text-decoration: none; transition: border-color .15s, background .15s; }
@@ -264,6 +273,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, canvas:focus-vi
   .map-panel { min-height: 0; height: auto; flex: 0 0 min(560px, 65vh); flex-basis: min(560px, 65dvh); }
   .map-controls { top: 12px; right: 12px; }
   .basemap-switch { top: 126px; right: 12px; }
+  .region-switch { top: 169px; right: 12px; }
   .model-area-toolbar { top: 12px; left: 12px; width: min(345px, calc(100% - 69px)); }
   .legend { right: 12px; bottom: 18px; max-width: min(360px, calc(100% - 24px)); }
   .basemap-badge { display: none; }
