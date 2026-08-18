@@ -126,6 +126,7 @@ const MIN_TILE_BUDGET = 32;
 const MAX_TILE_BUDGET = 1024;
 const DEFAULT_TILE_BUDGET = 256;
 const CLEARANCE_DISTANCE_FT = 2000;
+const ALTITUDE_COMMIT_KEYS = new Set(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"]);
 const FAA_MAX_HORIZONTAL_ACCURACY_FT = 6076;
 const CLEARANCE_WORKER_TIMEOUT_MS = 75_000;
 const FEET_PER_LAT_DEGREE = 364_000;
@@ -1159,6 +1160,7 @@ export function AirspacePlanner() {
   const loadedOriginDataRef = useRef<Origin>(CHICAGO_ORIGIN);
   const liveDataRef = useRef({ altitudeFt: 1800, buildings: [] as Building[], zones: [] as Zone[], origin: CHICAGO_ORIGIN, sourceMode: "overture" as "overture" | "local" });
   const [altitudeFt, setAltitudeFt] = useState(1800);
+  const [committedAltitudeFt, setCommittedAltitudeFt] = useState(1800);
   const [tileBudget, setTileBudget] = useState(DEFAULT_TILE_BUDGET);
   const [groupDenseOverlays, setGroupDenseOverlays] = useState(true);
   const [renderedDenseOverlayGrouping, setRenderedDenseOverlayGrouping] = useState<boolean | null>(null);
@@ -1198,8 +1200,8 @@ export function AirspacePlanner() {
   const [overlayUpdating, setOverlayUpdating] = useState(false);
 
   useEffect(() => {
-    liveDataRef.current = { altitudeFt, buildings, zones, origin, sourceMode };
-  }, [altitudeFt, buildings, zones, origin, sourceMode]);
+    liveDataRef.current = { altitudeFt: committedAltitudeFt, buildings, zones, origin, sourceMode };
+  }, [committedAltitudeFt, buildings, zones, origin, sourceMode]);
 
   useEffect(() => {
     drawingAreaRef.current = drawingArea;
@@ -2184,10 +2186,9 @@ export function AirspacePlanner() {
 
   useEffect(() => {
     if (!modelAvailable || !workerModelReadyRef.current) return;
-    if (renderedAltitudeRef.current === altitudeFt) return;
-    const timer = window.setTimeout(() => void computeOverlayRef.current(altitudeFt), 120);
-    return () => window.clearTimeout(timer);
-  }, [altitudeFt, modelAvailable]);
+    if (renderedAltitudeRef.current === committedAltitudeFt) return;
+    void computeOverlayRef.current(committedAltitudeFt);
+  }, [committedAltitudeFt, modelAvailable]);
 
   useEffect(() => {
     if (!mapReady || !mapRef.current) return;
@@ -2345,6 +2346,12 @@ export function AirspacePlanner() {
     setRenderError("");
     setDrawingArea((current) => !current);
     selectionStartRef.current = null;
+  }
+
+  function commitFlightAltitude(value: number) {
+    const constrained = Math.max(1000, Math.min(18000, Math.round(value / 100) * 100));
+    setAltitudeFt(constrained);
+    setCommittedAltitudeFt(constrained);
   }
 
   function useCurrentView() {
@@ -2534,8 +2541,21 @@ export function AirspacePlanner() {
         <aside className="control-panel">
           <div className="eyebrow-row"><span className="eyebrow">FLIGHT ALTITUDE</span><span className={`live-label ${overlayUpdating ? "processing" : modelAvailable ? "" : "paused"}`}><i /> {overlayUpdating ? "UPDATING MODEL" : "ENVELOPE MODEL"}</span></div>
           <div className="altitude-readout"><strong>{altitudeFt.toLocaleString()}</strong><span>FT<br />MSL</span></div>
-          <label className="slider-wrap"><span className="visually-hidden">Flight altitude in feet above mean sea level</span><input type="range" min="1000" max="18000" step="100" value={altitudeFt} onChange={(event) => setAltitudeFt(Number(event.target.value))} /><span className="range-labels"><b>1,000</b><b>18,000 FT MSL</b></span></label>
-          <div className="preset-row" aria-label="Altitude presets">{[2000, 5000, 10000, 15000].map((preset) => <button key={preset} className={altitudeFt === preset ? "active" : ""} onClick={() => setAltitudeFt(preset)}>{preset.toLocaleString()}</button>)}</div>
+          <label className="slider-wrap"><span className="visually-hidden">Flight altitude in feet above mean sea level; clearance geometry updates when adjustment finishes</span><input
+            type="range"
+            min="1000"
+            max="18000"
+            step="100"
+            value={altitudeFt}
+            onChange={(event) => setAltitudeFt(Number(event.target.value))}
+            onPointerUp={(event) => commitFlightAltitude(Number(event.currentTarget.value))}
+            onPointerCancel={(event) => commitFlightAltitude(Number(event.currentTarget.value))}
+            onKeyUp={(event) => {
+              if (ALTITUDE_COMMIT_KEYS.has(event.key)) commitFlightAltitude(Number(event.currentTarget.value));
+            }}
+            onBlur={(event) => commitFlightAltitude(Number(event.currentTarget.value))}
+          /><span className="range-labels"><b>1,000</b><b>18,000 FT MSL</b></span></label>
+          <div className="preset-row" aria-label="Altitude presets">{[2000, 5000, 10000, 15000].map((preset) => <button key={preset} className={altitudeFt === preset ? "active" : ""} onClick={() => commitFlightAltitude(preset)}>{preset.toLocaleString()}</button>)}</div>
 
           <div className="rule-block">
             <div className="rule-heading"><span className="rule-number">§</span><span><small>MODELED STANDARD</small>91.119(b) clearance</span></div>
@@ -2684,7 +2704,7 @@ export function AirspacePlanner() {
           <p>When the dense-overlay option is enabled and more than 500 obstacles are active, nearby envelopes are conservatively grouped for the red overlay so the altitude control stays responsive. Turning the option off preserves every active obstacle envelope in the red geometry. The selected-point check always tests individual building envelopes.</p>
           <p>Terrain tiles are divided into 64×64-pixel cells. Each land or shoreline cell uses its highest DEM pixel, and terrain conflicts expand 2,000 feet horizontally just like obstacle envelopes. Invalid, out-of-range, or incomplete Terrarium tiles stop the model instead of producing a clearance result. Open water uses guarded z{WATER_TILE_ZOOM} Overture geometry; uncertain and intermittent-water cells remain terrain.</p>
           <p>Over open water, §91.119(c) does not prescribe a fixed height above the water surface, but it still restricts proximity to people, vessels, vehicles, and structures, and §91.119(a) still applies. This model preserves building and FAA-obstacle screening but does not know real-time vessel, vehicle, or person locations.</p>
-          <p>Building and terrain evaluation use fixed full-detail tiles independent of camera zoom. Building floor counts use a conservative {ESTIMATED_FLOOR_HEIGHT_FT}-foot-per-floor estimate, while buildings with no height information retain the 30-foot fallback. Each render includes a 2,000-ft halo around the U.S.-clipped Model Area; the selectable tile budget is currently {tileBudget} tiles.</p>
+          <p>Building and terrain evaluation use fixed full-detail tiles independent of camera zoom. The altitude readout follows the slider while it moves, but red clearance geometry recalculates only when the slider adjustment finishes. Building floor counts use a conservative {ESTIMATED_FLOOR_HEIGHT_FT}-foot-per-floor estimate, while buildings with no height information retain the 30-foot fallback. Each render includes a 2,000-ft halo around the U.S.-clipped Model Area; the selectable tile budget is currently {tileBudget} tiles.</p>
           <p>Mapping, imports, selected-point checks, and Model Areas use Overture Maps territorial country and U.S. dependency polygons. A selection may cross the boundary, but only its U.S. intersection is displayed and evaluated; the remainder stays gray. Unlike state shoreline polygons, the mask includes Overture’s best approximation of maritime jurisdiction, including the U.S. portions of the Great Lakes.</p>
           <p>The rendered result remains fixed while you pan or zoom and changes only when you press Re-render. The FAA evaluates whether an area is “congested” case by case, so the selected box is treated as a conservative study area—not labeled as an official FAA boundary.</p>
           <div className="modal-warning"><b>Small UAS note</b><span>Part 107 generally uses a different 400-foot AGL framework and may require airspace authorization. This prototype models the Part 91 rule named above.</span></div>

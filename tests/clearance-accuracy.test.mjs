@@ -141,3 +141,13 @@ test("the worker applies dense obstacle grouping only when the UI option enables
   assert.match(worker, /denseOverlayGroupingEnabled = message\.groupDenseOverlays/);
   assert.match(worker, /denseOverlayGroupingEnabled && activeObstacles > 500/);
 });
+
+test("the flight-altitude slider commits model updates only after adjustment", async () => {
+  const planner = await readFile(new URL("../app/airspace-planner.tsx", import.meta.url), "utf8");
+  assert.match(planner, /const \[committedAltitudeFt, setCommittedAltitudeFt\] = useState\(1800\)/);
+  assert.match(planner, /onChange=\{\(event\) => setAltitudeFt\(Number\(event\.target\.value\)\)\}/);
+  assert.match(planner, /onPointerUp=\{\(event\) => commitFlightAltitude\(Number\(event\.currentTarget\.value\)\)\}/);
+  assert.match(planner, /onKeyUp=\{\(event\) => \{/);
+  assert.match(planner, /computeOverlayRef\.current\(committedAltitudeFt\)/);
+  assert.doesNotMatch(planner, /computeOverlayRef\.current\(altitudeFt\)/);
+});
