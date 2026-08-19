@@ -2527,6 +2527,11 @@ export function AirspacePlanner() {
 
   return (
     <main className="app-shell">
+      <aside className="legal-bar" aria-label="Planning aid disclaimer">
+        <span><b>PLANNING AID ONLY</b> This model will never be fully accurate or complete and cannot determine whether a flight is legal or authorized.</span>
+        <button onClick={() => setInfoOpen(true)}>Read limitations</button>
+      </aside>
+
       <header className="topbar">
         <button className="brand" onClick={activateOverture} aria-label="Clearance home and use automatic Overture buildings"><span className="brand-mark" aria-hidden="true"><i /></span><span>CLEARANCE</span></button>
         <div className="rule-chip"><span>RULESET</span> FAA §91.119(b)</div>
@@ -2686,7 +2691,6 @@ export function AirspacePlanner() {
         </section>
       </section>
 
-      <footer className="legal-bar"><span><b>PLANNING AID ONLY</b> This model will never be fully accurate or complete and cannot determine whether a flight is legal or authorized.</span><button onClick={() => setInfoOpen(true)}>Read limitations</button></footer>
       {importError && <div className="toast error" role="alert"><span>!</span>{importError}<button onClick={() => setImportError("")} aria-label="Dismiss error">×</button></div>}
 
       {infoOpen && <div className="modal-backdrop">
