@@ -2531,19 +2531,13 @@ export function AirspacePlanner() {
 
   return (
     <main className="app-shell">
-      <header className="top-chrome">
+      <header className="topbar">
         <button className="brand" onClick={activateOverture} aria-label="Clearance home and use automatic Overture buildings"><span className="brand-mark" aria-hidden="true"><i /></span><span>CLEARANCE</span></button>
-        <aside className="legal-bar" aria-label="Planning aid disclaimer">
-          <span><b>PLANNING AID ONLY</b><span className="disclaimer-detail"> This model will never be fully accurate or complete and cannot determine whether a flight is legal or authorized.</span></span>
-          <button onClick={() => setInfoOpen(true)}>Read limitations</button>
-        </aside>
-        <div className="topbar">
-          <div className="rule-chip"><span>RULESET</span> FAA §91.119(b)</div>
-          <div className="topbar-actions">
-            <div className={`overture-status ${modelStatusClass}`}><span className="status-dot" /><span><small>MODEL DATA</small>{overlayUpdating ? "Updating clearance overlay" : modelDataLabel}</span></div>
-            <button className="icon-button" onClick={() => setInfoOpen(true)} aria-label="About this planning aid">?</button>
-            <input ref={inputRef} className="visually-hidden" type="file" accept=".csv,.geojson,.json,application/geo+json,text/csv" onChange={handleImport} />
-          </div>
+        <div className="rule-chip"><span>RULESET</span> FAA §91.119(b)</div>
+        <div className="topbar-actions">
+          <div className={`overture-status ${modelStatusClass}`}><span className="status-dot" /><span><small>MODEL DATA</small>{overlayUpdating ? "Updating clearance overlay" : modelDataLabel}</span></div>
+          <button className="icon-button" onClick={() => setInfoOpen(true)} aria-label="About this planning aid">?</button>
+          <input ref={inputRef} className="visually-hidden" type="file" accept=".csv,.geojson,.json,application/geo+json,text/csv" onChange={handleImport} />
         </div>
       </header>
 
@@ -2695,6 +2689,11 @@ export function AirspacePlanner() {
           <div className="basemap-badge">BASEMAP · {basemap === "street" ? "CARTO / OPENSTREETMAP" : "FAA SECTIONAL + TAC"}</div>
         </section>
       </section>
+
+      <footer className="legal-bar" aria-label="Planning aid disclaimer">
+        <span><b>PLANNING AID ONLY</b> This model will never be fully accurate or complete and cannot determine whether a flight is legal or authorized.</span>
+        <button onClick={() => setInfoOpen(true)}>Read limitations</button>
+      </footer>
 
       {importError && <div className="toast error" role="alert"><span>!</span>{importError}<button onClick={() => setImportError("")} aria-label="Dismiss error">×</button></div>}
 
