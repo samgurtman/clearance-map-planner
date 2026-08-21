@@ -1175,7 +1175,6 @@ export function AirspacePlanner() {
   const [terrainNote, setTerrainNote] = useState("Surface elevations and open-water masking render only for the selected area");
   const [faaObstacleStatus, setFaaObstacleStatus] = useState<FaaObstacleStatus>("idle");
   const [faaObstacleNote, setFaaObstacleNote] = useState("FAA obstacles render only for the selected area");
-  const [faaObstacleCount, setFaaObstacleCount] = useState(0);
   const [faaObstacleSnapshot, setFaaObstacleSnapshot] = useState<string | null>(null);
   const [sourceMode, setSourceMode] = useState<"overture" | "local">("overture");
   const [overtureRelease, setOvertureRelease] = useState(OVERTURE_FALLBACK_RELEASE);
@@ -1901,7 +1900,6 @@ export function AirspacePlanner() {
           const result = await loadFaaObstacleRows(selection, onProgress);
           if (disposed) return null;
           setFaaObstacleStatus("ready");
-          setFaaObstacleCount(result.rows.length);
           setFaaObstacleSnapshot(result.manifest.sourceLastModified);
           setFaaObstacleNote(`${result.rows.length.toLocaleString()} FAA obstacle${result.rows.length === 1 ? "" : "s"} in the selected area, accuracy margin, and clearance halo · ${result.manifest.sourceLastModified || "current bundled"} DDOF snapshot`);
           onProgress?.(1);
@@ -1910,7 +1908,6 @@ export function AirspacePlanner() {
           console.error("FAA obstacle data load failed", error);
           if (!disposed) {
             setFaaObstacleStatus("error");
-            setFaaObstacleCount(0);
             setFaaObstacleNote("FAA obstacle coverage could not be loaded, so no clearance conclusion is shown.");
           }
           return null;
@@ -1944,7 +1941,6 @@ export function AirspacePlanner() {
         setTerrainNote("Waiting to render surface elevations…");
         setFaaObstacleStatus("loading");
         setFaaObstacleNote("Waiting to render FAA obstacle coverage…");
-        setFaaObstacleCount(0);
         setRenderProgress({ active: true, value: 2, label: "Preparing selected area" });
         let buildingProgress = liveDataRef.current.sourceMode === "local" ? 1 : 0;
         let terrainProgress = 0;
@@ -2284,7 +2280,6 @@ export function AirspacePlanner() {
       setTerrainStatus("idle");
       setTerrainNote("Surface elevations and open-water masking render only after you press Render");
       setFaaObstacleStatus("idle");
-      setFaaObstacleCount(0);
       setFaaObstacleNote("FAA obstacles render only after you press Render");
       setRenderError("");
       mapRef.current?.setMaxBounds(US_MAP_REGIONS[importedRegion].bounds);
@@ -2328,7 +2323,6 @@ export function AirspacePlanner() {
     setTerrainStatus("idle");
     setTerrainNote("Surface elevations and open-water masking render only after you press Render");
     setFaaObstacleStatus("idle");
-    setFaaObstacleCount(0);
     setFaaObstacleNote("FAA obstacles render only after you press Render");
     setImportError("");
     setRenderError("");
@@ -2417,7 +2411,6 @@ export function AirspacePlanner() {
     setFlaggedSquareMiles(0);
     setTerrainStatus("idle");
     setFaaObstacleStatus("idle");
-    setFaaObstacleCount(0);
     setDataNote("Select an area, then render building coverage");
     setTerrainNote("Surface elevations and open-water masking render only for the selected area");
     setFaaObstacleNote("FAA obstacles render only for the selected area");
@@ -2468,16 +2461,27 @@ export function AirspacePlanner() {
       : terrainStatus === "ready"
         ? "Surface elevation · Loaded"
         : "Surface elevation · View too wide";
-  const faaObstacleCoverageLabel = faaObstacleStatus === "idle"
+  const modeledObstacleCounts = useMemo(() => {
+    let buildingEnvelopes = 0;
+    let faaObstacles = 0;
+
+    for (const modeledObstacle of buildings) {
+      if (modeledObstacle.sourceKind === "faa-obstacle") faaObstacles += 1;
+      else buildingEnvelopes += 1;
+    }
+
+    return { buildingEnvelopes, faaObstacles };
+  }, [buildings]);
+  const modelCompletionLabel = faaObstacleStatus === "idle"
     ? "FAA obstacles · Awaiting render"
     : faaObstacleStatus === "loading"
       ? "FAA obstacles · Loading"
       : faaObstacleStatus === "error"
         ? "FAA obstacles · Unavailable"
-        : `FAA obstacles · ${faaObstacleCount.toLocaleString()} loaded`;
+        : `${modeledObstacleCounts.buildingEnvelopes.toLocaleString()} building ${modeledObstacleCounts.buildingEnvelopes === 1 ? "envelope" : "envelopes"} · ${modeledObstacleCounts.faaObstacles.toLocaleString()} FAA ${modeledObstacleCounts.faaObstacles === 1 ? "obstacle" : "obstacles"}`;
   const modelDataLabel = !buildingCoverageAvailable
     ? sourceMode === "overture" ? overtureCoverageLabel : "Local buildings · Ready"
-    : terrainStatus !== "ready" ? terrainCoverageLabel : faaObstacleCoverageLabel;
+    : terrainStatus !== "ready" ? terrainCoverageLabel : modelCompletionLabel;
   const modelBadge = !renderedBounds && !renderProgress.active && coverageStatus === "idle" && terrainStatus === "idle"
     ? "RENDER"
     : !buildingCoverageAvailable
@@ -2527,18 +2531,19 @@ export function AirspacePlanner() {
 
   return (
     <main className="app-shell">
-      <aside className="legal-bar" aria-label="Planning aid disclaimer">
-        <span><b>PLANNING AID ONLY</b> This model will never be fully accurate or complete and cannot determine whether a flight is legal or authorized.</span>
-        <button onClick={() => setInfoOpen(true)}>Read limitations</button>
-      </aside>
-
-      <header className="topbar">
+      <header className="top-chrome">
         <button className="brand" onClick={activateOverture} aria-label="Clearance home and use automatic Overture buildings"><span className="brand-mark" aria-hidden="true"><i /></span><span>CLEARANCE</span></button>
-        <div className="rule-chip"><span>RULESET</span> FAA §91.119(b)</div>
-        <div className="topbar-actions">
-          <div className={`overture-status ${modelStatusClass}`}><span className="status-dot" /><span><small>MODEL DATA</small>{overlayUpdating ? "Updating clearance overlay" : modelDataLabel}</span></div>
-          <button className="icon-button" onClick={() => setInfoOpen(true)} aria-label="About this planning aid">?</button>
-          <input ref={inputRef} className="visually-hidden" type="file" accept=".csv,.geojson,.json,application/geo+json,text/csv" onChange={handleImport} />
+        <aside className="legal-bar" aria-label="Planning aid disclaimer">
+          <span><b>PLANNING AID ONLY</b><span className="disclaimer-detail"> This model will never be fully accurate or complete and cannot determine whether a flight is legal or authorized.</span></span>
+          <button onClick={() => setInfoOpen(true)}>Read limitations</button>
+        </aside>
+        <div className="topbar">
+          <div className="rule-chip"><span>RULESET</span> FAA §91.119(b)</div>
+          <div className="topbar-actions">
+            <div className={`overture-status ${modelStatusClass}`}><span className="status-dot" /><span><small>MODEL DATA</small>{overlayUpdating ? "Updating clearance overlay" : modelDataLabel}</span></div>
+            <button className="icon-button" onClick={() => setInfoOpen(true)} aria-label="About this planning aid">?</button>
+            <input ref={inputRef} className="visually-hidden" type="file" accept=".csv,.geojson,.json,application/geo+json,text/csv" onChange={handleImport} />
+          </div>
         </div>
       </header>
 
